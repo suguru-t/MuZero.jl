@@ -21,7 +21,7 @@ function load_networks(conf, step)
 
 	if !isfile(path)
 		# println("⚠️  Checkpoint not found at: $path")
-		# println("   Initializing fresh random networks instead.")
+		# println("   Initializing fresh random networks.")
 		return (
 			representation = init_representation(hyper, conf),
 			prediction = init_prediction(hyper, conf),
@@ -39,14 +39,13 @@ function load_networks(conf, step)
 end
 
 NNs = load_networks(conf, LOAD_STEP)
-env = TicTacToe()
+env = Connect4()
 
 println("\n" * "="^40)
-println(" 🎮 Tic-Tac-Toe MuZero Agent")
+println(" 🔴 Connect 4 MuZero Agent")
 println("="^40)
-println("You are playing against the MuZero agent.")
-println("Enter a number (1-9) to place your mark.")
-println("The agent searches $(conf.num_iters) moves ahead.")
+println("You are Player 1.")
+println("Enter column (1-7) to play.")
 println("="^40 * "\n")
 
 competitive_play!(env, NNs, conf; buffer_to_disk = false)

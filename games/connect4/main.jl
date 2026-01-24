@@ -1,9 +1,12 @@
 using Distributed
+using Dates # Added for timestamping logs
 
+# --- Configuration for Workers ---
 const REQUIRED_SELF_PLAYERS = 1
 const REQUIRED_LEARNERS = 1
 const TARGET_DEDICATED_WORKERS = REQUIRED_SELF_PLAYERS + REQUIRED_LEARNERS
 
+# --- Worker Setup ---
 current_procs = nprocs()
 required_total_procs = 1 + TARGET_DEDICATED_WORKERS
 
@@ -40,7 +43,7 @@ end
 
 include("params.jl")
 
-env = TicTacToe()
+env = Connect4()
 
 training_step = RemoteChannel(() -> Channel{Int}(1))
 num_played_games = RemoteChannel(() -> Channel{Int}(1))
@@ -50,6 +53,7 @@ total_samples = RemoteChannel(() -> Channel{Int}(1))
 
 remote_NNs = RemoteChannel(() -> Channel{NamedTuple{(:representation, :prediction, :dynamics), Tuple{Any, Any, Any}}}(1))
 
+# NEW: The Game Queue (Replaces RemoteBufferChannel)
 game_queue = RemoteChannel(() -> Channel{GameHistory}(200))
 
 # println("🧠 Initializing Networks...")
@@ -87,7 +91,7 @@ function print_structure(model, indent = 0, prefix = "")
 end
 
 # println("\n" * "="^60)
-# println("🏗️  Network Architecture")
+# println("🏗️  Connect 4 Network Architecture")
 # println("="^60)
 # println("\n🔹 Representation Network:"); print_structure(rep); println("   ↳ Params: $(count_params(rep))")
 # println("\n🔹 Prediction Network:"); print_structure(pred); println("   ↳ Params: $(count_params(pred))")
@@ -113,6 +117,7 @@ self_play_pids = dedicated_ids
 for pid in self_play_pids
 	@spawnat pid begin
 		try
+			# Updated signature: No counters, use game_queue
 			self_play!(env,
 				training_step,
 				remote_NNs,
@@ -139,6 +144,22 @@ catch e
 		println("\n🛑 Training stopped by user.")
 	else
 		println("❌ Learner process failed: $e")
+
+		# Save error to log file
+		try
+			log_path = joinpath(conf.results_path, "learner_error.log")
+			open(log_path, "w") do io
+				println(io, "\n" * "="^60)
+				println(io, "TIMESTAMP: $(now())")
+				println(io, "ERROR TYPE: $(typeof(e))")
+				println(io, "-"^30)
+				showerror(io, e)
+				println(io, "\n" * "="^60)
+			end
+			println("📝 Error details saved to: $log_path")
+		catch log_err
+			println("❌ Failed to write error log: $log_err")
+		end
 	end
 finally
 	# println("🧹 Cleaning up workers...")

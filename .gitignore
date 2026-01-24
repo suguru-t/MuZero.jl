@@ -57,7 +57,7 @@ docs/_build/
 
 # Environments
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -66,3 +66,9 @@ venv.bak/
 
 # mkdocs documentation
 /site
+
+*jld2
+*log
+events.out.*
+*DS_Store
+.DS_Store

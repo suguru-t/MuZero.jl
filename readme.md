@@ -41,7 +41,7 @@ julia --project ./games/tictactoe/play.jl
 
 * [x] Residual Network and Fully connected network in [Flux](https://github.com/FluxML/Flux.jl)
 * [x] Reinforcement Learning enviornment and TicTacToe example adapted from [ReinforcementLearning.jl](https://github.com/JuliaReinforcementLearning/ReinforcementLearning.jl)
-* [ ] Parallel computing natively supported by Julia
+* [x] Parallel computing natively supported by Julia
 * [ ] Multi GPU support for the training and the selfplay
 * [x] Model weights automatically saved at checkpoints
 * [x] Single and two player mode

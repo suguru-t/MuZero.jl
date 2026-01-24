@@ -1,103 +1,59 @@
 using Serialization
-using Parameters:@with_kw
-using Statistics:mean
-using CUDA
+using Parameters: @with_kw
+using Statistics: mean
 using Flux: cpu, Parallel
-import Flux, Functors
+using Flux: Flux
 using Base.Threads
-
-CUDA.allowscalar(false)
-array_on_gpu(::Array) = false
-array_on_gpu(::CuArray) = true
-array_on_gpu(arr) = error("Usupported array type: ", typeof(arr))
 
 using Flux: relu, softmax, flatten
 using Flux.Losses: mse, logitcrossentropy, crossentropy
-using ParameterSchedulers: Cos,Stateful, next!
+using ParameterSchedulers
+using TensorBoardLogger
+using Logging
+using JLD2
+using Dates
+
 using Flux: Chain, Dense, Conv, BatchNorm, SkipConnection, MeanPool, MaxPool, AdaptiveMeanPool
-import Zygote
-using BSON: @save
+using Zygote: Zygote
 
-
-#####
-##### Support functions
-#####
-
-# This should be included in Flux
-function loss_grad(f, args...)
-    loss, back = Zygote.pullback(f, args...)
-    grad = back(Zygote.sensitivity(loss))
-    return loss, grad
-end
-
-# Invert the scaling (defined in https://arxiv.org/abs/1805.11593) of predicted_values #TODO
 invert_scaling(x) = convert(Float32, sign(x) * (((sqrt(1 + 4 * 0.001 * (abs.(x) + 1 + 0.001)) - 1) / (2 * 0.001))^2 - 1))
-
-# Reduce the scale (defined in https://arxiv.org/abs/1805.11593) of value and reward before feeding to network
-scaling(x) = convert(Float32, sign(x) * (sqrt(abs(x) + 1) - 1 + 0.001*x)) # dims=(features, batch)
-
-# function convert_input_tuple(nn, input::Tuple)
-#     return map(input) do arr
-#         array_on_gpu(nn.first_head[end].b) ? Flux.gpu(arr) : arr
-#     end
-# end
-
-# function convert_output_tuple(output::Tuple)
-# 	return map(output) do arr
-# 		Flux.cpu(arr)
-# 	end
-# end
+scaling(x) = convert(Float32, sign(x) * (sqrt(abs(x) + 1) - 1 + 0.001 * x))
 
 to_singletons(x) = reshape(x, size(x)..., 1)
-squeeze(x) = reshape(x, size(x)[1:end - 1])
-unsqueeze(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:dim - 1]..., 1, size(xs)[dim:end]...))
+squeeze(x) = reshape(x, size(x)[1:(end-1)])
+unsqueeze(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:(dim-1)]..., 1, size(xs)[dim:end]...))
 
-######
-###### Networks
-######
-
-# custom split layer
 struct Split{T}
-  paths::T
+	paths::T
 end
-
 Split(paths...) = Split(paths)
-
-Flux.@functor Split
-
+Flux.@layer Split
 (m::Split)(x::AbstractArray) = map(f -> f(x), m.paths)
 
 function make_dense(indim::Int, outdim::Int, bnmom::Float32, hyper::FeedForwardHP)
-    if hyper.use_batch_norm
-      Chain(
-        Dense(indim, outdim),
-        BatchNorm(outdim, relu, momentum=bnmom))
-    else
-      	Dense(indim, outdim, relu)
-    end
+	if hyper.use_batch_norm
+		Chain(Dense(indim, outdim), BatchNorm(outdim, relu, momentum = bnmom))
+	else
+		Dense(indim, outdim, relu)
+	end
 end
 
 hlayers(depth::Int, hsize, bnmom, hyper) = [make_dense(hsize, hsize, bnmom, hyper) for _ in 1:depth]
 
-#######
-####### FeedForward Networks
-#######
-
-
-function init_representation(hyper::FeedForwardHP)
-	indim = prod([conf.observation_shape[1],conf.observation_shape[2], (conf.observation_shape[3]*(conf.stacked_observations+1)+conf.stacked_observations)])
+function init_representation(hyper::FeedForwardHP, conf::Config)
+	indim = prod([conf.observation_shape[1], conf.observation_shape[2], (conf.observation_shape[3] * (conf.stacked_observations + 1) + conf.stacked_observations)])
 	outdim = hyper.hidden_state_size
 	bnmom = hyper.batch_norm_momentum
 	hsize = hyper.width_hidden
 	layers = Chain(flatten,
-	make_dense(indim, hsize, bnmom, hyper),
-	hlayers(hyper.depth_representation, hsize, bnmom, hyper)...,
-	Dense(hsize, outdim)
+		make_dense(indim, hsize, bnmom, hyper),
+		hlayers(hyper.depth_representation, hsize, bnmom, hyper)...,
+		Dense(hsize, outdim),
 	)
 	return layers
 end
 
-function init_prediction(hyper::FeedForwardHP)
+function init_prediction(hyper::FeedForwardHP, conf::Config)
 	bnmom = hyper.batch_norm_momentum
 	indim = hyper.hidden_state_size
 	outdim = length(conf.action_space)
@@ -115,25 +71,19 @@ function init_prediction(hyper::FeedForwardHP)
 	return Chain(common, Split(value_head, policy_head))
 end
 
-function init_dynamics(hyper::FeedForwardHP)
+function init_dynamics(hyper::FeedForwardHP, conf::Config)
 	bnmom = hyper.batch_norm_momentum
-	indim = prod([conf.observation_shape[1],conf.observation_shape[2], (conf.observation_shape[3]+1)])
+	indim = prod([conf.observation_shape[1], conf.observation_shape[2], (conf.observation_shape[3] + 1)])
 	outdim = hyper.hidden_state_size
 	hsize = hyper.width_hidden
-	# state_input = Chain(
-	# flatten,
-	# make_dense(indim, hsize, bnmom, hyper))
-	# action_input = make_dense(outdim, hsize, bnmom, hyper)
 	common = Chain(
 		flatten,
-		make_dense(indim, hsize, bnmom, hyper), 
-		# Parallel(vcat, state_input, action_input),
-		# make_dense(2 * hsize, hsize, bnmom, hyper),
-		hlayers(hyper.depth_dynamics, hsize, bnmom, hyper)...
+		make_dense(indim, hsize, bnmom, hyper),
+		hlayers(hyper.depth_dynamics, hsize, bnmom, hyper)...,
 	)
 	state_head = Chain(
 		hlayers(hyper.depth_state_head, hsize, bnmom, hyper)...,
-		Dense(hsize, outdim)
+		Dense(hsize, outdim),
 	)
 	reward_head = Chain(
 		hlayers(hyper.depth_reward, hsize, bnmom, hyper)...,
@@ -141,298 +91,224 @@ function init_dynamics(hyper::FeedForwardHP)
 	return Chain(common, Split(state_head, reward_head))
 end
 
-########
-######## ResNets
-########
-
-function resnet_block(size::Tuple{Int,Int}, n::Int, bnmom::Float32)
-  pad = size .÷ 2
-  layers = Chain(
-    Conv(size, n => n, pad=pad),
-    BatchNorm(n, relu, momentum=bnmom),
-    Conv(size, n => n, pad=pad),
-    BatchNorm(n, momentum=bnmom))
-  return Chain(
-    SkipConnection(layers, +),
-    x -> relu.(x))
+function resnet_block(size::Tuple{Int, Int}, n::Int, bnmom::Float32)
+	;
+end
+function init_representation(hyper::ResNetHP, conf::Config)
+	;
+end
+function init_prediction(hyper::ResNetHP, conf::Config)
+	;
+end
+function init_dynamics(hyper::ResNetHP, conf::Config)
+	;
 end
 
-function init_representation(hyper::ResNetHP)
-	indim = conf.observation_shape
-	ksize = hyper.conv_kernel_size
-	@assert all(ksize .% 2 .== 1)
-	pad = ksize .÷ 2
-	nf = hyper.num_filters
-	bnmom = hyper.batch_norm_momentum
-	
-	common = Chain(
-		Conv(ksize, indim[3] => nf, pad=pad),
-		BatchNorm(nf, relu, momentum=bnmom),
-		[resnet_block(ksize, nf, bnmom) for i in 1:hyper.num_blocks]...)
+function make_dynamics_input(states::Array{Float32, 4}, actions::AbstractVector, conf::Config)::Array{Float32, 4}
+	norm_actions = actions ./ length(conf.action_space)
+	reshaped_actions = reshape(norm_actions, 1, 1, 1, :)
+	w, h = conf.observation_shape[1], conf.observation_shape[2]
+	action_planes = repeat(reshaped_actions, w, h, 1, 1)
+	scaled_states = states .* 2.0f0
+	return cat(scaled_states, action_planes, dims = 3)
+end
 
-	hyper.representation_output_size = Flux.outputsize(common, ((indim)..., 1))
+function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::Config, hyper)::Bool
+	local_buffer = Dict{Int, GameHistory}()
+	next_game_id = 1
 
-	if downsampling
-	downsample = Chain(
-		Conv(size, indim[3] => indim[3], stride=2, pad=pad),
-		[resnet_block(size, indim[3], bnmom) for i in 1:2]...,
-		Conv(size, indim[3] => indim[3] * 2, stride=2, pad=pad),
-		[resnet_block(size, indim[3] * 2, bnmom) for i in 1:3]...,
-		MeanPool(3, stride=2, pad=1),
-		[resnet_block(size, indim[3] * 2, bnmom) for i in 1:3]...,
-		MeanPool(3, stride=2, pad=1),
-		Conv(ksize, indim[3] * 2 => nf, pad=pad),
-		BatchNorm(nf, relu, momentum=bnmom),
-		[resnet_block(ksize, nf, bnmom) for i in 1:hyper.num_blocks]...)
-		return downsample
-	else
-		return common
+	timestamp = Dates.format(now(), "yyyy-mm-dd_HH-MM-SS")
+	log_dir = joinpath(conf.results_path, "tensorboard_logs", timestamp)
+	mkpath(log_dir)
+	logger = TBLogger(log_dir, tb_overwrite, min_level = Logging.Info)
+
+	println("Learner: Waiting for initial games...")
+
+	while length(local_buffer) < conf.batch_size
+		if isready(game_queue)
+			hist = take!(game_queue)
+			insert_game!(local_buffer, hist, next_game_id, conf)
+			next_game_id += 1
+		else
+			sleep(1.0)
+		end
 	end
-end
+	println("Learner: Buffer has $(length(local_buffer)) games. Starting training. Logs at: $log_dir")
 
-function init_prediction(hyper::ResNetHP)
-	indim = hyper.representation_output_size
-	outdim = length(conf.action_space)
-	ksize = (1, 1)
-	@assert all(ksize .% 2 .== 1)
-	pad = ksize .÷ 2
-	nf = hyper.num_filters
-	npf = hyper.num_second_head_filters
-	nvf = hyper.num_first_head_filters
-	bnmom = hyper.batch_norm_momentum
-	hsize = hyper.width_hidden
-	common = Chain(
-		Conv(ksize, indim[3] => nf, pad=pad),
-		BatchNorm(nf, relu, momentum=bnmom),
-		[resnet_block(ksize, nf, bnmom) for i in 1:hyper.num_blocks]...)
-
-	value_head = Chain(
-        Conv(ksize, nf => nvf),
-        BatchNorm(nvf, relu, momentum=bnmom),
-        flatten,
-        Dense(indim[1] * indim[2] * nvf, hsize, relu),
-		hlayers(hyper.depth_value, hsize, bnmom, hyper)...,
-        Dense(hsize, 1, tanh))
-
-	policy_head = Chain(
-			Conv(ksize, nf => npf),
-			BatchNorm(npf, relu, momentum=bnmom),
-			flatten,
-			Dense(indim[1] * indim[2] * npf, hsize),
-			hlayers(hyper.depth_value, hsize, bnmom, hyper)...,
-			Dense(hsize, outdim),
-			softmax)
-	return Chain(common, Split(value_head, policy_head))
-end
-
-function init_dynamics(hyper::ResNetHP)
-	indim = hyper.representation_output_size
-	ksize = (1, 1)
-	@assert all(ksize .% 2 .== 1)
-	pad = ksize .÷ 2
-	nvf = hyper.num_first_head_filters
-	bnmom = hyper.batch_norm_momentum
-	hsize = hyper.width_hidden
-	common = Chain(
-		Conv(ksize, indim[3] + hyper.stacked_actions => indim[3], pad=pad),
-		BatchNorm(indim[3], relu, momentum=bnmom),
-		[resnet_block(ksize, indim[3], bnmom) for i in 1:hyper.num_blocks]...)
-
-	state_head = Chain(
-		Conv(ksize, indim[3] => indim[3], pad=pad),
-		BatchNorm(indim[3], relu, momentum=bnmom),
-		[resnet_block(ksize, indim[3], bnmom) for i in 1:hyper.num_blocks]...)
-
-	reward_head = Chain(
-        Conv(ksize, indim[3] => nvf),
-        BatchNorm(nvf, relu, momentum=bnmom),
-        flatten,
-        Dense(indim[1] * indim[2] * nvf, hsize, relu),
-		hlayers(hyper.depth_value, hsize, bnmom, hyper)...,
-        Dense(hsize, 1, tanh))
-
-		return Chain(common, Split(state_head, reward_head))
-end
-
-##########
-##########  Training
-##########
-
-function loss(params, predictions::Tuple, targets::Tuple, weight_batch::Any, gradient_scale_batch::Matrix{Float32})::Float32
-	value, reward, policy_logits = predictions
-	target_values, target_rewards, target_policies = targets
-	# By default we Correct PER bias by using importance-sampling (IS) weights
-	# But if conf.PER is false then weight_batch is 1, and we avoid the correction
-	if !conf.PER
-		weight_batch = 1.0f0
-	end
-
-	# L2 regularization
-	sqnorm(x) = sum(abs2, x)
-	
-    value_loss = mse(value, target_values, agg=x->mean((sum(x,dims=1)./gradient_scale_batch).*weight_batch))
-	# TODO Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
-
-	if conf.intermediate_rewards
-    	reward_loss = mse(reward, target_rewards, agg=x->mean((sum(x,dims=1)./gradient_scale_batch).*weight_batch))
-	else
-		reward_loss = 0.0f0
-	end
-    policy_loss = logitcrossentropy(policy_logits, target_policies, agg=x->mean((sum(x,dims=2)./gradient_scale_batch).*weight_batch))
-	
-	loss = sum([value_loss, reward_loss, policy_loss])
-	# TODO value loss and reward loss are much smaller that the policy loss
-	
-	#loss + L2
-    return loss + sum(sqnorm, params)
-end
-
-"""
-Makes a state_action stack along the channels dimension, as input for the dynamics net
-"""
-function make_dynamics_input(states::Array{Float32,4},actions::Vector{Float32},conf::Config)::Array{Float32,4}
-	actions ./= length(conf.action_space)
-	state_actions=Array{Float32,4}(undef, conf.observation_shape[1], conf.observation_shape[2], conf.observation_shape[3]+1 ,0)
-	for i in 1:length(actions)
-		action = actions[i] * ones(Float32,(conf.observation_shape[1], conf.observation_shape[2]))
-		# Scale the gradient by half at the start of the dynamics function (See paper appendix Training)
-		state = states[:,:,:,i] * 2.0f0
-		state_action = cat(state, action, dims=3)
-		state_actions = cat(state_actions, state_action, dims=4)
-	end
-	return state_actions
-end
-
-function learning!(num_played_games,
-training_step,
-remote_NNs,
-remote_buffer::RemoteChannel{BufferChannel})::Bool
-	
-    while fetch(num_played_games) < 1 # TODO, GPU should always have data available to train on.
-        # @info "Waiting for replay buffer to be filled"
-		sleep(0.1)
-    end
-
-	# @info "Training Started"
-
-	optimiser = Flux.ADAMW()
-  	schedule = Stateful(Cos(λ0=1e-4, λ1=1e-1, period=10))
+	# FIX: Increased Learning Rate to 2e-3 (was 1e-4)
+	opt_def = Flux.AdamW(2e-3, (0.9, 0.999), 1e-4)
+	schedule = ParameterSchedulers.Stateful(ParameterSchedulers.CosAnneal(λ0 = 2e-3, λ1 = 1e-4, period = 50))
 
 	NNs = fetch(remote_NNs)
-	representation= deepcopy(NNs.representation)
-	prediction= deepcopy(NNs.prediction)
-	dynamics= deepcopy(NNs.dynamics)
+	representation = deepcopy(NNs.representation)
+	prediction = deepcopy(NNs.prediction)
+	dynamics = deepcopy(NNs.dynamics)
+
+	opt_state_rep = Flux.setup(opt_def, representation)
+	opt_state_pred = Flux.setup(opt_def, prediction)
+	opt_state_dyn = Flux.setup(opt_def, dynamics)
+
 	training_step_ = 0
 
 	while training_step_ ≤ conf.training_steps
-		
-		buffer = fetch(remote_buffer)
 
-        next_batch = get_batch(buffer)
+		while isready(game_queue)
+			hist = take!(game_queue)
+			insert_game!(local_buffer, hist, next_game_id, conf)
+			next_game_id += 1
+		end
+
+		next_batch = get_batch(local_buffer, conf)
 		index_batch, batch = next_batch
-    	observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch = batch
+		observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch = batch
+
 		gradient_scale_batch = permutedims(gradient_scale_batch)
 		conf.PER ? weight_batch = permutedims(weight_batch) : nothing
-		# @info "Batch Sizes are:" size(observation_batch) size(action_batch) size(target_values) size(target_rewards) size(target_policies) size(gradient_scale_batch)
-		# observation_batch: Width, height, channels, batch_size
-        # action_batch: num_unroll_steps + 1, batch_size
-        # target_values: num_unroll_steps+1, batch_size
-        # target_rewards: num_unroll_steps+1, batch_size
-        # target_policies: len(action_space), num_unroll_steps+1, batch_size
-        # weight_batch, gradient_scale_batch: 1, batch_size
 
-    	priorities = zeros(eltype(target_values), size(target_values))
+		current_eta = ParameterSchedulers.next!(schedule)
+		Flux.adjust!(opt_state_rep, current_eta)
+		Flux.adjust!(opt_state_pred, current_eta)
+		Flux.adjust!(opt_state_dyn, current_eta)
 
-		## Generate predictions, first for the observation then for num_unroll_steps*hidden_states
-		hidden_state = representation(observation_batch)
-		if ndims(hidden_state)==2
-			hidden_state=reshape(hidden_state, (conf.observation_shape...,conf.batch_size))
-		end
-		predicted_values, predicted_policies = prediction(hidden_state)
-		predicted_rewards = zeros((1,conf.batch_size))
-		predicted_policies=Flux.unsqueeze(predicted_policies, 2)
-
-		for i = 1:conf.num_unroll_steps
-        	value, policy_logits = prediction(hidden_state)
-			if ndims(hidden_state)==2
-				hidden_state=reshape(hidden_state, (conf.observation_shape...,conf.batch_size))
-			end
-			policy_logits=Flux.unsqueeze(policy_logits, 2)
-			state_action=make_dynamics_input(hidden_state, action_batch[i,:],conf)
-			hidden_state, reward = dynamics(state_action)
-			if ndims(hidden_state)==2
-				hidden_state=reshape(hidden_state, (conf.observation_shape...,conf.batch_size))
-			end
-			# @info "Size of Predictions" size(value) size(reward) size(policy_logits) size(predicted_values) size(predicted_rewards) size(predicted_policies)
-			predicted_values= vcat(predicted_values, value)
-			predicted_rewards= vcat(predicted_rewards, reward)
-			predicted_policies= cat(predicted_policies, policy_logits, dims=2)
+		val, grads = Flux.withgradient(representation, prediction, dynamics) do m_rep, m_pred, m_dyn
+			compute_total_loss(m_rep, m_pred, m_dyn, observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch, conf)
 		end
 
-        # predictions & targets: if_any_other_dim, num_unroll_steps + 1, batch
-		targets = (target_values, target_rewards, target_policies)
-		predictions = (predicted_values, predicted_rewards, predicted_policies)
+		Flux.update!(opt_state_rep, representation, grads[1])
+		Flux.update!(opt_state_pred, prediction, grads[2])
+		Flux.update!(opt_state_dyn, dynamics, grads[3])
 
-		# @info "Predictions and Targets generated successfully" size(target_values) size(target_rewards) size(target_policies) size(predicted_values) size(predicted_rewards) size(predicted_policies)
-
-		params_representation = Flux.params(representation)
-		params_prediction = Flux.params(prediction)
-		params_dynamics = Flux.params(dynamics)
-
-		optimiser[1].eta = next!(schedule) # changes with every minibatch
-
-		# calculates losses over all the samples in this batch at once
-		l_representation, grads_representation = loss_grad(params_representation) do
-			loss(params_representation, predictions, targets, weight_batch, gradient_scale_batch) 
-		end
-		l_prediction, grads_prediction = loss_grad(params_prediction) do
-			loss(params_prediction, predictions, targets, weight_batch, gradient_scale_batch) 
-		end
-		l_dynamics, grads_dynamics = loss_grad(params_dynamics) do
-			loss(params_dynamics, predictions, targets, weight_batch, gradient_scale_batch) 
-		end
-
-		Flux.update!(optimiser, params_representation, grads_representation)
-		Flux.update!(optimiser, params_prediction, grads_prediction)
-		Flux.update!(optimiser, params_dynamics, grads_dynamics)
-
-		
 		if conf.PER
-			priorities = (abs.(predicted_values - target_values)).^conf.PER_alpha
-            # Save new priorities in the replay buffer (See https://arxiv.org/abs/1803.00933)
-            update_priorities!(buffer, priorities, index_batch)
-        end
+			(final_pred_values, _, _) = unroll_network(representation, prediction, dynamics, observation_batch, action_batch, conf)
+			priorities = (abs.(final_pred_values - target_values)) .^ conf.PER_alpha
+			update_priorities!(local_buffer, priorities, index_batch)
+		end
 
 		training_step_ += 1
 
-		# update_remote_counter!(training_step, 1)
-		# take!(training_step)
-		println(training_step_)
-		put!(training_step, training_step_)
-		println(training_step_)
+		# Detailed logging
+		if training_step_ <= 100 || training_step_ % 50 == 0
+			# Recalculate component losses for display (no gradient needed)
+			# This helps debugging which part isn't learning
+			(v_loss, p_loss, r_loss) = compute_loss_breakdown(representation, prediction, dynamics, observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch, conf)
 
-
-		# Save to the shared storage(disk) #TODO make them availbal on memory
-        if training_step_ % conf.checkpoint_interval == 0 && training_step_ > 1 
-			
-			# old_net=take!(remote_NNs)
-			put!(remote_NNs, (representation=representation, prediction=prediction, dynamics=dynamics))
-			
-			@info "Training Progress" training_step_
-			@info "Representation loss =" l_representation
-			@info "Prediction loss =" l_prediction
-			@info "Dynamics loss=" l_dynamics
-
-			if training_step_ > round(Int, 0.9*conf.training_steps)
-				#saving networks to disk
-				representation= cpu(representation)
-				prediction= cpu(prediction)
-				dynamics= cpu(dynamics)
-				serialize(joinpath(conf.networks_path,"$(training_step_)_representation.bin"), representation)
-				serialize(joinpath(conf.networks_path,"$(training_step_)_prediction.bin"), prediction)
-				serialize(joinpath(conf.networks_path,"$(training_step_)_dynamics.bin"), dynamics)
+			with_logger(logger) do
+				@info "train" loss=val value_loss=v_loss policy_loss=p_loss reward_loss=r_loss learning_rate=current_eta
 			end
-        end
+		end
+
+		take!(training_step)
+		put!(training_step, training_step_)
+
+		if training_step_ % conf.checkpoint_interval == 0 && training_step_ > 1
+			take!(remote_NNs)
+			put!(remote_NNs, (representation = representation, prediction = prediction, dynamics = dynamics))
+
+			rep_cpu = cpu(representation)
+			pred_cpu = cpu(prediction)
+			dyn_cpu = cpu(dynamics)
+
+			jldsave(joinpath(conf.networks_path, "latest_checkpoint.jld2");
+				representation = rep_cpu,
+				prediction = pred_cpu,
+				dynamics = dyn_cpu,
+				step = training_step_,
+			)
+
+			if training_step_ % (conf.checkpoint_interval * 5) == 0
+				jldsave(joinpath(conf.networks_path, "$(training_step_)_checkpoint.jld2");
+					representation = rep_cpu,
+					prediction = pred_cpu,
+					dynamics = dyn_cpu,
+					step = training_step_,
+				)
+			end
+		end
 	end
 	return true
+end
+
+function compute_total_loss(rep, pred, dyn, obs_batch, act_batch, t_vals, t_rews, t_pols, w_batch, g_scale, conf)
+	(p_vals, p_rews, p_pols) = unroll_network(rep, pred, dyn, obs_batch, act_batch, conf)
+	preds = (p_vals, p_rews, p_pols)
+	targets = (t_vals, t_rews, t_pols)
+	base_loss = loss_base(preds, targets, w_batch, g_scale, conf)
+	return base_loss
+end
+
+# New helper for breakdown
+function compute_loss_breakdown(rep, pred, dyn, obs_batch, act_batch, t_vals, t_rews, t_pols, w_batch, g_scale, conf)
+	(p_vals, p_rews, p_pols) = unroll_network(rep, pred, dyn, obs_batch, act_batch, conf)
+
+	!conf.PER ? w_batch = 1.0f0 : nothing
+
+	v_loss = mse(p_vals, t_vals, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* w_batch))
+
+	if conf.intermediate_rewards
+		r_loss = mse(p_rews, t_rews, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* w_batch))
+	else
+		r_loss = 0.0f0
+	end
+
+	p_loss = logitcrossentropy(p_pols, t_pols, agg = x -> mean((sum(x, dims = 2) ./ g_scale) .* w_batch))
+
+	return (v_loss, p_loss, r_loss)
+end
+
+function loss_base(predictions, targets, weight_batch, gradient_scale_batch, conf)
+	value, reward, policy_logits = predictions
+	target_values, target_rewards, target_policies = targets
+	!conf.PER ? weight_batch = 1.0f0 : nothing
+	value_loss = mse(value, target_values, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* weight_batch))
+	if conf.intermediate_rewards
+		reward_loss = mse(reward, target_rewards, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* weight_batch))
+	else
+		reward_loss = 0.0f0
+	end
+	policy_loss = logitcrossentropy(policy_logits, target_policies, agg = x -> mean((sum(x, dims = 2) ./ gradient_scale_batch) .* weight_batch))
+	return sum([value_loss, reward_loss, policy_loss])
+end
+
+function unroll_network(representation, prediction, dynamics, observation_batch, action_batch, conf)
+	hidden_state = representation(observation_batch)
+	if ndims(hidden_state) == 2
+		hidden_state = reshape(hidden_state, (conf.observation_shape..., conf.batch_size))
+	end
+
+	p0_val, p0_pol = prediction(hidden_state)
+	p0_pol = Flux.unsqueeze(p0_pol, 2)
+
+	vals_buf = Zygote.Buffer(Vector{AbstractArray}(undef, conf.num_unroll_steps + 1))
+	pols_buf = Zygote.Buffer(Vector{AbstractArray}(undef, conf.num_unroll_steps + 1))
+	rews_buf = Zygote.Buffer(Vector{AbstractArray}(undef, conf.num_unroll_steps + 1))
+
+	vals_buf[1] = p0_val
+	pols_buf[1] = p0_pol
+	zero_rew = zero(p0_val)
+	rews_buf[1] = zero_rew
+
+	curr_state = hidden_state
+
+	for k ∈ 1:conf.num_unroll_steps
+		state_action = make_dynamics_input(curr_state, action_batch[k, :], conf)
+		curr_state, reward = dynamics(state_action)
+		if ndims(curr_state) == 2
+			curr_state = reshape(curr_state, (conf.observation_shape..., conf.batch_size))
+		end
+		val, pol = prediction(curr_state)
+		pol = Flux.unsqueeze(pol, 2)
+		vals_buf[k+1] = val
+		pols_buf[k+1] = pol
+		rews_buf[k+1] = reward
+	end
+
+	vals = copy(vals_buf)
+	pols = copy(pols_buf)
+	rews = copy(rews_buf)
+
+	final_vals = reduce(vcat, vals)
+	final_rews = reduce(vcat, rews)
+	final_pols = reduce((x, y) -> cat(x, y, dims = 2), pols)
+
+	return (final_vals, final_rews, final_pols)
 end
