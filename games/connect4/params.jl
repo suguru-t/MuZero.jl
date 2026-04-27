@@ -22,7 +22,7 @@ const conf = Config(
 )
 
 const hyper = FeedForwardHP(
-	width_hidden = 16,  # Increased from 16 to 64 for better learning capacity          
+	width_hidden = 32,  # Increased from 16 to 64 for better learning capacity          
 	depth_representation = 3,
 	depth_prediction = 3,
 	depth_dynamics = 3,
