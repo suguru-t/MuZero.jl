@@ -1,5 +1,12 @@
+
+# 必要なパッケージをまとめてusing
 using Distributed
-using Dates # Added for timestamping logs
+using Dates
+using Flux
+using ParameterSchedulers
+using CUDA
+using cuDNN
+using Distributions
 
 # --- Configuration for Workers ---
 const REQUIRED_SELF_PLAYERS = 1
@@ -20,6 +27,12 @@ end
 worker_ids = workers()
 dedicated_ids = filter(x -> x != 1, worker_ids)
 
+# ====== 以下の3行をここに追加！ ======
+for pid in worker_ids
+    remotecall_fetch(() -> Base.eval(Main, :(using Flux, CUDA)), pid) # これで全てのワーカーでFluxとCUDAが利用可能になります
+end
+# ====================================
+
 # println("✅ Dedicated PIDs: $dedicated_ids")
 
 if length(dedicated_ids) < TARGET_DEDICATED_WORKERS
@@ -27,9 +40,19 @@ if length(dedicated_ids) < TARGET_DEDICATED_WORKERS
 	exit(1)
 end
 
+# ===== ここにこの1行を追加！ =====
+using Flux, CUDA, cuDNN
+# =================================
+
 @everywhere begin
+
+	# --- ここから追加 ---
+    using Logging 	  # ロギングのために必要
+    _old_logger = global_logger(NullLogger()) # ログ出力を完全にミュート
+    Base.eval(Main, :(using Flux, CUDA))      # ミュート状態でFluxを読み込む
+    global_logger(_old_logger)                # ミュートを解除して元に戻す
+    # --- ここまで ---
 	using Distributed
-	using Flux
 	using ParameterSchedulers
 
 	const SRC_DIR = joinpath(@__DIR__, "../../src")
@@ -75,13 +98,13 @@ function print_structure(model, indent = 0, prefix = "")
 		end
 		return
 	end
-	if hasproperty(model, :paths) && occursin("Split", string(typeof(model)))
-		println("$(sp)$(prefix)Split Head")
-		for (i, path) in enumerate(model.paths)
-			print_structure(path, indent + 3, "Path $i: ")
-		end
-		return
-	end
+	if model isa Flux.Parallel
+        println("$(sp)$(prefix)Parallel Head")
+        for (i, path) in enumerate(model.layers) # paths を layers に変更
+            print_structure(path, indent + 3, "Path $i: ")
+        end
+        return
+    end
 	if model isa Dense
 		w = size(model.weight)
 		println("$(sp)$(prefix)Dense($(w[2]) ➡️  $(w[1])) | σ: $(model.σ)")

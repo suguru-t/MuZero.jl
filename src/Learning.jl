@@ -2,6 +2,7 @@ using Serialization
 using Parameters: @with_kw
 using Statistics: mean
 using Flux: cpu, Parallel
+using CUDA
 using Flux: Flux
 using Base.Threads
 
@@ -16,6 +17,9 @@ using Dates
 using Flux: Chain, Dense, Conv, BatchNorm, SkipConnection, MeanPool, MaxPool, AdaptiveMeanPool
 using Zygote: Zygote
 
+# この1行を新しく追加　
+apply_tanh(x) = tanh.(x)
+
 invert_scaling(x) = convert(Float32, sign(x) * (((sqrt(1 + 4 * 0.001 * (abs.(x) + 1 + 0.001)) - 1) / (2 * 0.001))^2 - 1))
 scaling(x) = convert(Float32, sign(x) * (sqrt(abs(x) + 1) - 1 + 0.001 * x))
 
@@ -23,12 +27,6 @@ to_singletons(x) = reshape(x, size(x)..., 1)
 squeeze(x) = reshape(x, size(x)[1:(end-1)])
 unsqueeze(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:(dim-1)]..., 1, size(xs)[dim:end]...))
 
-struct Split{T}
-	paths::T
-end
-Split(paths...) = Split(paths)
-Flux.@layer Split
-(m::Split)(x::AbstractArray) = map(f -> f(x), m.paths)
 
 function make_dense(indim::Int, outdim::Int, bnmom::Float32, hyper::FeedForwardHP)
 	if hyper.use_batch_norm
@@ -63,12 +61,12 @@ function init_prediction(hyper::FeedForwardHP, conf::Config)
 		hlayers(hyper.depth_prediction, hsize, bnmom, hyper)...)
 	value_head = Chain(
 		hlayers(hyper.depth_value, hsize, bnmom, hyper)...,
-		Dense(hsize, 1, tanh))
+		Dense(hsize, 1), apply_tanh)
 	policy_head = Chain(
 		hlayers(hyper.depth_policy, hsize, bnmom, hyper)...,
 		Dense(hsize, outdim),
 		softmax)
-	return Chain(common, Split(value_head, policy_head))
+	return Chain(common, Flux.Parallel(tuple, value_head, policy_head))
 end
 
 function init_dynamics(hyper::FeedForwardHP, conf::Config)
@@ -87,8 +85,8 @@ function init_dynamics(hyper::FeedForwardHP, conf::Config)
 	)
 	reward_head = Chain(
 		hlayers(hyper.depth_reward, hsize, bnmom, hyper)...,
-		Dense(hsize, 1, hyper.reward_activation))
-	return Chain(common, Split(state_head, reward_head))
+		Dense(hsize, 1), apply_tanh)
+	return Chain(common, Flux.Parallel(tuple, state_head, reward_head))
 end
 
 function resnet_block(size::Tuple{Int, Int}, n::Int, bnmom::Float32)
@@ -104,7 +102,7 @@ function init_dynamics(hyper::ResNetHP, conf::Config)
 	;
 end
 
-function make_dynamics_input(states::Array{Float32, 4}, actions::AbstractVector, conf::Config)::Array{Float32, 4}
+function make_dynamics_input(states::AbstractArray{Float32, 4}, actions::AbstractVector, conf::Config)
 	norm_actions = actions ./ length(conf.action_space)
 	reshaped_actions = reshape(norm_actions, 1, 1, 1, :)
 	w, h = conf.observation_shape[1], conf.observation_shape[2]
@@ -136,13 +134,13 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 	println("Learner: Buffer has $(length(local_buffer)) games. Starting training. Logs at: $log_dir")
 
 	# FIX: Increased Learning Rate to 2e-3 (was 1e-4)
-	opt_def = Flux.AdamW(2e-3, (0.9, 0.999), 1e-4)
-	schedule = ParameterSchedulers.Stateful(ParameterSchedulers.CosAnneal(λ0 = 2e-3, λ1 = 1e-4, period = 50))
+	opt_def = Flux.AdamW(1e-4, (0.9, 0.999), 1e-4)
+	schedule = ParameterSchedulers.Stateful(ParameterSchedulers.CosAnneal(λ0 = 5e-4, λ1 = 1e-4, period = 50))
 
 	NNs = fetch(remote_NNs)
-	representation = deepcopy(NNs.representation)
-	prediction = deepcopy(NNs.prediction)
-	dynamics = deepcopy(NNs.dynamics)
+	representation = gpu(deepcopy(NNs.representation))
+	prediction = gpu(deepcopy(NNs.prediction))
+	dynamics = gpu(deepcopy(NNs.dynamics))
 
 	opt_state_rep = Flux.setup(opt_def, representation)
 	opt_state_pred = Flux.setup(opt_def, prediction)
@@ -162,6 +160,15 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 		index_batch, batch = next_batch
 		observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch = batch
 
+		# GPUに転送
+		observation_batch = gpu(observation_batch)
+		action_batch = gpu(action_batch)
+		target_values = gpu(target_values)
+		target_rewards = gpu(target_rewards)
+		target_policies = gpu(target_policies)
+		weight_batch = gpu(weight_batch)
+		gradient_scale_batch = gpu(gradient_scale_batch)
+
 		gradient_scale_batch = permutedims(gradient_scale_batch)
 		conf.PER ? weight_batch = permutedims(weight_batch) : nothing
 
@@ -178,10 +185,16 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 		Flux.update!(opt_state_pred, prediction, grads[2])
 		Flux.update!(opt_state_dyn, dynamics, grads[3])
 
+		# ======== ここから追加 ========
+        grads = nothing  # 勾配データを明示的に破棄
+        GC.gc(true)      # ガベージコレクションを強制実行してGPUメモリを掃除！
+        CUDA.reclaim()   # CUDAのキャッシュも強制解放！           
+		 # ======== ここまで追加 ========
+
 		if conf.PER
 			(final_pred_values, _, _) = unroll_network(representation, prediction, dynamics, observation_batch, action_batch, conf)
 			priorities = (abs.(final_pred_values - target_values)) .^ conf.PER_alpha
-			update_priorities!(local_buffer, priorities, index_batch)
+			update_priorities!(local_buffer, cpu(priorities), index_batch)
 		end
 
 		training_step_ += 1
@@ -196,17 +209,19 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 				@info "train" loss=val value_loss=v_loss policy_loss=p_loss reward_loss=r_loss learning_rate=current_eta
 			end
 		end
+		println("Step: $training_step_, Loss: $val") #ステップごとに損失を表示
 
 		take!(training_step)
 		put!(training_step, training_step_)
 
 		if training_step_ % conf.checkpoint_interval == 0 && training_step_ > 1
-			take!(remote_NNs)
-			put!(remote_NNs, (representation = representation, prediction = prediction, dynamics = dynamics))
-
+		
 			rep_cpu = cpu(representation)
 			pred_cpu = cpu(prediction)
 			dyn_cpu = cpu(dynamics)
+
+			take!(remote_NNs)
+			put!(remote_NNs, (representation = rep_cpu, prediction = pred_cpu, dynamics = dyn_cpu))
 
 			jldsave(joinpath(conf.networks_path, "latest_checkpoint.jld2");
 				representation = rep_cpu,

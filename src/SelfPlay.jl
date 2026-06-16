@@ -124,11 +124,14 @@ global rng = MersenneTwister(1234)
 
 function select_child(node::Node, treeminmax::MinMaxStats, conf::Config)::Tuple{Int, Node}
 	actions = collect(keys(node.children))
+	if isempty(actions)
+		# 合法手がない場合はエラーを投げずに安全に終了
+		return nothing, nothing
+	end
 	children = collect(values(node.children))
-	ucb_scores=[ucb_score(node, child, treeminmax, conf) for child in children]
+	ucb_scores = [ucb_score(node, child, treeminmax, conf) for child in children]
 	max_ucb = maximum(ucb_scores)
-	max_ucbs=findall(x->x==max_ucb, ucb_scores)
-	i = 0
+	max_ucbs = findall(x -> x == max_ucb, ucb_scores)
 	i = rand(max_ucbs)
 	return actions[i], children[i]
 end
@@ -189,7 +192,13 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 	hidden_state, root_predicted_value, policy_logits = squeeze.([hidden_state, root_predicted_value, policy_logits])
 	reward = 0.0f0
 
-	@assert !isempty(legal_actions) "Legal actions should not be an empty array. Got $(legal_actions)"
+	if isempty(legal_actions)
+		println("[デバッグ] legal_actionsが空です (to_play=$(to_play))")
+		if hasmethod(render_game, (typeof(env),))
+			render_game(env)
+		end
+		error("Legal actions should not be an empty array. Got $(legal_actions)")
+	end
 	@assert Set(legal_actions) ⊆ Set(conf.action_space) "Legal actions should be a subset of the action space."
 	expand_node!(root, legal_actions, to_play, reward, policy_logits, hidden_state)
 
