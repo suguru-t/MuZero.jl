@@ -1,8 +1,7 @@
 using Serialization
 using Parameters: @with_kw
 using Statistics: mean
-using Flux: cpu, Parallel
-using CUDA
+using Flux: cpu, gpu, Parallel
 using Flux: Flux
 using Base.Threads
 
@@ -17,17 +16,24 @@ using Dates
 using Flux: Chain, Dense, Conv, BatchNorm, SkipConnection, MeanPool, MaxPool, AdaptiveMeanPool
 using Zygote: Zygote
 
-# この1行を新しく追加　
 apply_tanh(x) = tanh.(x)
+
+function maybe_gpu(x, conf::Config)
+	x === nothing && return nothing
+	return getproperty(conf, :selfplay_on_gpu) ? gpu(x) : x
+end
+
+function reclaim_cuda_if_loaded()
+	if isdefined(Main, :CUDA)
+		Main.CUDA.reclaim()
+	end
+	return nothing
+end
 
 invert_scaling(x) = convert(Float32, sign(x) * (((sqrt(1 + 4 * 0.001 * (abs.(x) + 1 + 0.001)) - 1) / (2 * 0.001))^2 - 1))
 scaling(x) = convert(Float32, sign(x) * (sqrt(abs(x) + 1) - 1 + 0.001 * x))
 
 to_singletons(x) = reshape(x, size(x)..., 1)
-squeeze(x) = reshape(x, size(x)[1:(end-1)])
-unsqueeze(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:(dim-1)]..., 1, size(xs)[dim:end]...))
-
-
 function make_dense(indim::Int, outdim::Int, bnmom::Float32, hyper::FeedForwardHP)
 	if hyper.use_batch_norm
 		Chain(Dense(indim, outdim), BatchNorm(outdim, relu, momentum = bnmom))
@@ -135,12 +141,12 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 
 	# FIX: Increased Learning Rate to 2e-3 (was 1e-4)
 	opt_def = Flux.AdamW(1e-4, (0.9, 0.999), 1e-4)
-	schedule = ParameterSchedulers.Stateful(ParameterSchedulers.CosAnneal(λ0 = 5e-4, λ1 = 1e-4, period = 50))
+	schedule = ParameterSchedulers.Stateful(ParameterSchedulers.CosAnneal(l0 = 5e-4, l1 = 1e-4, period = 50))
 
 	NNs = fetch(remote_NNs)
-	representation = gpu(deepcopy(NNs.representation))
-	prediction = gpu(deepcopy(NNs.prediction))
-	dynamics = gpu(deepcopy(NNs.dynamics))
+	representation = maybe_gpu(deepcopy(NNs.representation), conf)
+	prediction = maybe_gpu(deepcopy(NNs.prediction), conf)
+	dynamics = maybe_gpu(deepcopy(NNs.dynamics), conf)
 
 	opt_state_rep = Flux.setup(opt_def, representation)
 	opt_state_pred = Flux.setup(opt_def, prediction)
@@ -148,7 +154,7 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 
 	training_step_ = 0
 
-	while training_step_ ≤ conf.training_steps
+	while training_step_ <= conf.training_steps
 
 		while isready(game_queue)
 			hist = take!(game_queue)
@@ -160,14 +166,13 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 		index_batch, batch = next_batch
 		observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch = batch
 
-		# GPUに転送
-		observation_batch = gpu(observation_batch)
-		action_batch = gpu(action_batch)
-		target_values = gpu(target_values)
-		target_rewards = gpu(target_rewards)
-		target_policies = gpu(target_policies)
-		weight_batch = gpu(weight_batch)
-		gradient_scale_batch = gpu(gradient_scale_batch)
+		observation_batch = maybe_gpu(observation_batch, conf)
+		action_batch = maybe_gpu(action_batch, conf)
+		target_values = maybe_gpu(target_values, conf)
+		target_rewards = maybe_gpu(target_rewards, conf)
+		target_policies = maybe_gpu(target_policies, conf)
+		weight_batch = maybe_gpu(weight_batch, conf)
+		gradient_scale_batch = maybe_gpu(gradient_scale_batch, conf)
 
 		gradient_scale_batch = permutedims(gradient_scale_batch)
 		conf.PER ? weight_batch = permutedims(weight_batch) : nothing
@@ -185,11 +190,9 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 		Flux.update!(opt_state_pred, prediction, grads[2])
 		Flux.update!(opt_state_dyn, dynamics, grads[3])
 
-		# ======== ここから追加 ========
-        grads = nothing  # 勾配データを明示的に破棄
-        GC.gc(true)      # ガベージコレクションを強制実行してGPUメモリを掃除！
-        CUDA.reclaim()   # CUDAのキャッシュも強制解放！           
-		 # ======== ここまで追加 ========
+		grads = nothing
+		GC.gc(true)
+		reclaim_cuda_if_loaded()
 
 		if conf.PER
 			(final_pred_values, _, _) = unroll_network(representation, prediction, dynamics, observation_batch, action_batch, conf)
@@ -209,7 +212,7 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 				@info "train" loss=val value_loss=v_loss policy_loss=p_loss reward_loss=r_loss learning_rate=current_eta
 			end
 		end
-		println("Step: $training_step_, Loss: $val") #ステップごとに損失を表示
+		println("Step: $training_step_, Loss: $val")
 
 		take!(training_step)
 		put!(training_step, training_step_)
@@ -291,7 +294,7 @@ function unroll_network(representation, prediction, dynamics, observation_batch,
 	end
 
 	p0_val, p0_pol = prediction(hidden_state)
-	p0_pol = Flux.unsqueeze(p0_pol, 2)
+	p0_pol = Flux.unsqueeze(p0_pol; dims = 2)
 
 	vals_buf = Zygote.Buffer(Vector{AbstractArray}(undef, conf.num_unroll_steps + 1))
 	pols_buf = Zygote.Buffer(Vector{AbstractArray}(undef, conf.num_unroll_steps + 1))
@@ -304,14 +307,14 @@ function unroll_network(representation, prediction, dynamics, observation_batch,
 
 	curr_state = hidden_state
 
-	for k ∈ 1:conf.num_unroll_steps
+	for k in 1:conf.num_unroll_steps
 		state_action = make_dynamics_input(curr_state, action_batch[k, :], conf)
 		curr_state, reward = dynamics(state_action)
 		if ndims(curr_state) == 2
 			curr_state = reshape(curr_state, (conf.observation_shape..., conf.batch_size))
 		end
 		val, pol = prediction(curr_state)
-		pol = Flux.unsqueeze(pol, 2)
+		pol = Flux.unsqueeze(pol; dims = 2)
 		vals_buf[k+1] = val
 		pols_buf[k+1] = pol
 		rews_buf[k+1] = reward

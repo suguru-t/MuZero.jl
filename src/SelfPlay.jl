@@ -3,8 +3,8 @@ using Serialization
 using ReinforcementLearningBase
 using Flux
 
-squeeze(x) = dropdims(x, dims = (findall(size(x) .== 1)...,))
-unsqueeze(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:(dim-1)]..., 1, size(xs)[dim:end]...))
+drop_singleton_dims(x) = dropdims(x, dims = (findall(size(x) .== 1)...,))
+insert_singleton_dim(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:(dim-1)]..., 1, size(xs)[dim:end]...))
 
 function make_state_action(state::Array{Float32, 3}, action::Int, conf::Config)::Array{Float32, 3}
 	norm_action = action / length(conf.action_space)
@@ -69,21 +69,21 @@ function node_value(node::Node)::Float32
 	end
 end
 
-function expand_node!(node::Node, actions, to_play::Int, reward::Float32, policy_logits::Vector{Float32}, hidden_state::Array{Float32, 3})::Nothing
-	policy_values = softmax([policy_logits[a] for a in actions])
+function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state)
+	policy_values = softmax(Float32[policy_logits[a] for a in actions])
 	policy = Dict([(a, policy_values[i]) for (i, a) in enumerate(actions)])
 	node.children = Dict([(action, Node(prior = prob)) for (action, prob) in policy])
-	node.to_play = to_play
-	node.reward = reward
-	node.hidden_state = hidden_state
+	node.to_play = Int(to_play)
+	node.reward = Float32(reward)
+	node.hidden_state = Array{Float32, 3}(hidden_state)
 	return nothing
 end
 
-function add_exploration_noise!(node::Node, dirichlet_α::Float32, exploration_ϵ::Float32)::Nothing
+function add_exploration_noise!(node::Node, dirichlet_alpha::Float32, exploration_epsilon::Float32)::Nothing
 	actions = collect(keys(node.children))
-	noise = rand(Dirichlet(length(actions), dirichlet_α))
+	noise = rand(Dirichlet(length(actions), dirichlet_alpha))
 	for (a, n) in zip(actions, noise)
-		node.children[a].prior = node.children[a].prior * (1 - exploration_ϵ) + n * exploration_ϵ
+		node.children[a].prior = node.children[a].prior * (1 - exploration_epsilon) + n * exploration_epsilon
 	end
 	return nothing
 end
@@ -99,7 +99,7 @@ end
 
 function get_stacked_observations(history::GameHistory, index::Int, num_stacked_observations::Int, conf::Config)::Array{Float32, 3}
 	stacked_observations = copy(history.observation_history[:, :, :, index])
-	for past_observation_index ∈ (index-1):-1:(index-num_stacked_observations)
+	for past_observation_index in (index-1):-1:(index-num_stacked_observations)
 		if 1 <= past_observation_index
 			action_plane = fill(Float32(history.action_history[past_observation_index]), (conf.observation_shape[1], conf.observation_shape[2], 1))
 			previous_observation = cat(
@@ -125,8 +125,7 @@ global rng = MersenneTwister(1234)
 function select_child(node::Node, treeminmax::MinMaxStats, conf::Config)::Tuple{Int, Node}
 	actions = collect(keys(node.children))
 	if isempty(actions)
-		# 合法手がない場合はエラーを投げずに安全に終了
-		return nothing, nothing
+		error("Cannot select a child from an unexpanded node.")
 	end
 	children = collect(values(node.children))
 	ucb_scores = [ucb_score(node, child, treeminmax, conf) for child in children]
@@ -182,34 +181,32 @@ end
 
 function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to_play::Int, exploration::Bool, NNs, conf::Config)::Node
 	root = Node(prior = 0.0)
-	observation = unsqueeze(observation, 4)
+	observation = insert_singleton_dim(observation, 4)
 	hidden_state = NNs.representation(observation)
 	if ndims(hidden_state)==2
 		hidden_state=reshape(hidden_state, (conf.observation_shape..., 1))
 	end
 
 	root_predicted_value, policy_logits = NNs.prediction(hidden_state)
-	hidden_state, root_predicted_value, policy_logits = squeeze.([hidden_state, root_predicted_value, policy_logits])
+	hidden_state, root_predicted_value, policy_logits = drop_singleton_dims.([hidden_state, root_predicted_value, policy_logits])
+	hidden_state_array::Array{Float32, 3} = Array{Float32, 3}(hidden_state)
+	policy_logits_vector::Vector{Float32} = vec(Float32.(policy_logits))
 	reward = 0.0f0
 
 	if isempty(legal_actions)
-		println("[デバッグ] legal_actionsが空です (to_play=$(to_play))")
-		if hasmethod(render_game, (typeof(env),))
-			render_game(env)
-		end
 		error("Legal actions should not be an empty array. Got $(legal_actions)")
 	end
-	@assert Set(legal_actions) ⊆ Set(conf.action_space) "Legal actions should be a subset of the action space."
-	expand_node!(root, legal_actions, to_play, reward, policy_logits, hidden_state)
+	@assert issubset(Set(legal_actions), Set(conf.action_space)) "Legal actions should be a subset of the action space."
+	expand_node!(root, legal_actions, to_play, reward, policy_logits_vector, hidden_state_array)
 
 	if exploration
-		add_exploration_noise!(root, conf.dirichlet_α, conf.exploration_ϵ)
+		add_exploration_noise!(root, conf.dirichlet_alpha, conf.exploration_epsilon)
 	end
 
 	treeminmax = MinMaxStats(Inf, -Inf)
 
 	max_tree_depth = 0
-	for iter ∈ 1:conf.num_iters
+	for iter in 1:conf.num_iters
 		node = root
 		virtual_to_play = to_play
 		search_path = [node]
@@ -223,14 +220,19 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		end
 
 		parent = search_path[end-1]
-		value, policy_logits = NNs.prediction(unsqueeze(parent.hidden_state, 4))
 		state_action = make_state_action(parent.hidden_state, action, conf)
-		state_action = unsqueeze(state_action, 4)
+		state_action = insert_singleton_dim(state_action, 4)
 		next_hidden_state, reward = NNs.dynamics(state_action)
 		if ndims(next_hidden_state)==2
 			next_hidden_state=reshape(next_hidden_state, (conf.observation_shape..., 1))
 		end
-		value, policy_logits, next_hidden_state, reward = squeeze.([value, policy_logits, next_hidden_state, reward])
+		next_hidden_state, reward = drop_singleton_dims.([next_hidden_state, reward])
+		next_hidden_state = Array{Float32, 3}(next_hidden_state)
+
+		value, policy_logits = NNs.prediction(insert_singleton_dim(next_hidden_state, 4))
+		value, policy_logits = drop_singleton_dims.([value, policy_logits])
+		policy_logits = vec(Float32.(policy_logits))
+
 		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state)
 		backpropagate!(search_path, value[1], virtual_to_play, treeminmax, conf)
 		max_tree_depth = maximum([max_tree_depth, current_tree_depth])
@@ -238,7 +240,7 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 	return root
 end
 
-function select_action(node::Node, temperature::Float32)::Int
+function select_action(node::Node, temperature::Real)::Int
 	visit_counts = Int32[child.visit_count for child in values(node.children)]
 	actions = [action for action in keys(node.children)]
 	if temperature == 0.0f0
@@ -282,26 +284,21 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 		;
 		render_game(env);
 	end
-	observation=0;
-	root=0;
-	action=0
+	observation = ReinforcementLearningBase.reset!(env)
 
 	while !done && length(history.action_history) <= conf.max_moves
-		if !isnothing(conf.temperature_threshold) && length(history.action_history) ≥ conf.temperature_threshold
+		if !isnothing(conf.temperature_threshold) && length(history.action_history) >= conf.temperature_threshold
 			temperature = 0.0f0
-		end
-		if length(history.action_history)==0
-			observation = ReinforcementLearningBase.reset!(env)
 		end
 		p = ReinforcementLearningBase.current_player(env)
 		history.observation_history = cat(history.observation_history, observation, dims = 4)
 		stacked_observations = get_stacked_observations(history, lastindex(history.observation_history, 4), conf.stacked_observations, conf)
 
-		if opponent == "self" || muzero_player == p
+		action = if opponent == "self" || muzero_player == p
 			root = run_mcts(stacked_observations, ReinforcementLearningBase.legal_action_space(env, p), p, true, NNs, conf)
-			action = select_action(root, temperature)
+			select_action(root, temperature)
 		else
-			action = select_opponent_action(env, opponent, stacked_observations, conf)
+			select_opponent_action(env, opponent, stacked_observations, conf)
 		end
 
 		observation = env(action)

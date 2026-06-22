@@ -20,7 +20,7 @@ function load_networks(conf, step)
 	path = joinpath(conf.networks_path, filename)
 
 	if !isfile(path)
-		# println("⚠️  Checkpoint not found at: $path")
+		# println("Warning: Checkpoint not found at: $path")
 		# println("   Initializing fresh random networks instead.")
 		return (
 			representation = init_representation(hyper, conf),
@@ -29,7 +29,7 @@ function load_networks(conf, step)
 		)
 	end
 
-	# println("✅ Loading networks from: $path")
+	# println("Loading networks from: $path")
 	model_data = load(path)
 	return (
 		representation = model_data["representation"],
@@ -42,7 +42,7 @@ NNs = load_networks(conf, LOAD_STEP)
 env = TicTacToe()
 
 println("\n" * "="^40)
-println(" 🎮 Tic-Tac-Toe MuZero Agent")
+println(" Tic-Tac-Toe MuZero Agent")
 println("="^40)
 println("You are playing against the MuZero agent.")
 println("Enter a number (1-9) to place your mark.")

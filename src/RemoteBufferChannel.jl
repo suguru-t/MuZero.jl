@@ -25,7 +25,7 @@ function take!(buffer_channel::BufferChannel, k::Int)
 	return v
 end
 
-isready(buffer_channel::BufferChannel) = length(buffer_channel.buffer) ≥ 1
+isready(buffer_channel::BufferChannel) = length(buffer_channel.buffer) >= 1
 isready(buffer_channel::BufferChannel, k::Int) = haskey(buffer_channel.buffer, k)
 
 """

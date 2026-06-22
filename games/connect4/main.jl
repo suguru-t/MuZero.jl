@@ -1,12 +1,17 @@
 
-# 必要なパッケージをまとめてusing
+# Required packages
 using Distributed
 using Dates
 using Flux
 using ParameterSchedulers
-using CUDA
-using cuDNN
 using Distributions
+
+try
+	import CUDA
+	import cuDNN
+catch err
+	@warn "CUDA/cuDNN are unavailable; running without explicit GPU setup." exception = err
+end
 
 # --- Configuration for Workers ---
 const REQUIRED_SELF_PLAYERS = 1
@@ -19,7 +24,7 @@ required_total_procs = 1 + TARGET_DEDICATED_WORKERS
 
 if current_procs < required_total_procs
 	missing = required_total_procs - current_procs
-	# println("⚠️  Detected $(current_procs) processes. Need $required_total_procs (1 Master + $TARGET_DEDICATED_WORKERS Workers).")
+	# println("Warning: Detected $(current_procs) processes. Need $required_total_procs (1 Master + $TARGET_DEDICATED_WORKERS Workers).")
 	# println("   Adding $missing worker(s)...")
 	addprocs(missing, exeflags = "--project")
 end
@@ -27,31 +32,33 @@ end
 worker_ids = workers()
 dedicated_ids = filter(x -> x != 1, worker_ids)
 
-# ====== 以下の3行をここに追加！ ======
 for pid in worker_ids
-    remotecall_fetch(() -> Base.eval(Main, :(using Flux, CUDA)), pid) # これで全てのワーカーでFluxとCUDAが利用可能になります
+    remotecall_fetch(() -> begin
+		Base.eval(Main, :(using Flux))
+		try
+			Base.eval(Main, :(import CUDA))
+		catch
+		end
+	end, pid)
 end
-# ====================================
 
-# println("✅ Dedicated PIDs: $dedicated_ids")
+# println("Dedicated PIDs: $dedicated_ids")
 
 if length(dedicated_ids) < TARGET_DEDICATED_WORKERS
-	println("❌ ERROR: Failed to acquire enough dedicated workers.")
+	println("ERROR: Failed to acquire enough dedicated workers.")
 	exit(1)
 end
 
-# ===== ここにこの1行を追加！ =====
-using Flux, CUDA, cuDNN
-# =================================
-
 @everywhere begin
 
-	# --- ここから追加 ---
-    using Logging 	  # ロギングのために必要
-    _old_logger = global_logger(NullLogger()) # ログ出力を完全にミュート
-    Base.eval(Main, :(using Flux, CUDA))      # ミュート状態でFluxを読み込む
-    global_logger(_old_logger)                # ミュートを解除して元に戻す
-    # --- ここまで ---
+    using Logging
+    _old_logger = global_logger(NullLogger())
+    Base.eval(Main, :(using Flux))
+	try
+		Base.eval(Main, :(import CUDA))
+	catch
+	end
+    global_logger(_old_logger)
 	using Distributed
 	using ParameterSchedulers
 
@@ -79,7 +86,7 @@ remote_NNs = RemoteChannel(() -> Channel{NamedTuple{(:representation, :predictio
 # NEW: The Game Queue (Replaces RemoteBufferChannel)
 game_queue = RemoteChannel(() -> Channel{GameHistory}(200))
 
-# println("🧠 Initializing Networks...")
+# println("Initializing networks...")
 rep = init_representation(hyper, conf)
 pred = init_prediction(hyper, conf)
 dyn = init_dynamics(hyper, conf)
@@ -100,25 +107,26 @@ function print_structure(model, indent = 0, prefix = "")
 	end
 	if model isa Flux.Parallel
         println("$(sp)$(prefix)Parallel Head")
-        for (i, path) in enumerate(model.layers) # paths を layers に変更
+        for (i, path) in enumerate(model.layers)
             print_structure(path, indent + 3, "Path $i: ")
         end
         return
     end
 	if model isa Dense
 		w = size(model.weight)
-		println("$(sp)$(prefix)Dense($(w[2]) ➡️  $(w[1])) | σ: $(model.σ)")
+		activation = getproperty(model, Symbol("\u03c3"))
+		println("$(sp)$(prefix)Dense($(w[2]) -> $(w[1])) | activation: $(activation)")
 		return
 	end
 	println("$(sp)$(prefix)$(typeof(model))")
 end
 
 # println("\n" * "="^60)
-# println("🏗️  Connect 4 Network Architecture")
+# println("Connect 4 Network Architecture")
 # println("="^60)
-# println("\n🔹 Representation Network:"); print_structure(rep); println("   ↳ Params: $(count_params(rep))")
-# println("\n🔹 Prediction Network:"); print_structure(pred); println("   ↳ Params: $(count_params(pred))")
-# println("\n🔹 Dynamics Network:"); print_structure(dyn); println("   ↳ Params: $(count_params(dyn))")
+# println("\nRepresentation Network:"); print_structure(rep); println("   Params: $(count_params(rep))")
+# println("\nPrediction Network:"); print_structure(pred); println("   Params: $(count_params(pred))")
+# println("\nDynamics Network:"); print_structure(dyn); println("   Params: $(count_params(dyn))")
 # println("="^60 * "\n")
 
 put!(remote_NNs, (representation = rep, prediction = pred, dynamics = dyn))
@@ -132,11 +140,11 @@ put!(total_samples, 0)
 learner_pid = pop!(dedicated_ids)
 self_play_pids = dedicated_ids
 
-# println("📋 Assignments:")
+# println("Assignments:")
 # println("   Learner PID:   $learner_pid")
 # println("   Self-Play PIDs: $self_play_pids")
 
-# println("🚀 Starting Self-Play...")
+# println("Starting Self-Play...")
 for pid in self_play_pids
 	@spawnat pid begin
 		try
@@ -147,12 +155,12 @@ for pid in self_play_pids
 				game_queue,
 				conf)
 		catch e
-			println("❌ Worker $pid failed: $e")
+			println("Worker $pid failed: $e")
 		end
 	end
 end
 
-# println("📚 Starting Learner...")
+# println("Starting Learner...")
 learn = @spawnat learner_pid learning!(
 	training_step,
 	remote_NNs,
@@ -164,9 +172,9 @@ try
 	wait(learn)
 catch e
 	if e isa InterruptException
-		println("\n🛑 Training stopped by user.")
+		println("\nTraining stopped by user.")
 	else
-		println("❌ Learner process failed: $e")
+		println("Learner process failed: $e")
 
 		# Save error to log file
 		try
@@ -179,12 +187,12 @@ catch e
 				showerror(io, e)
 				println(io, "\n" * "="^60)
 			end
-			println("📝 Error details saved to: $log_path")
+			println("Error details saved to: $log_path")
 		catch log_err
-			println("❌ Failed to write error log: $log_err")
+			println("Failed to write error log: $log_err")
 		end
 	end
 finally
-	# println("🧹 Cleaning up workers...")
+	# println("Cleaning up workers...")
 	rmprocs(workers())
 end

@@ -33,8 +33,6 @@ function RLBase.legal_action_space_mask(env::Connect4, p)
     return mask
 end
 
-(env::Connect4)(action::Int) = env(action)
-
 function (env::Connect4)(col::Int)
     if env.winner !== nothing
         return get_observation(env)

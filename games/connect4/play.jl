@@ -20,7 +20,7 @@ function load_networks(conf, step)
 	path = joinpath(conf.networks_path, filename)
 
 	if !isfile(path)
-		# println("⚠️  Checkpoint not found at: $path")
+		# println("Warning: Checkpoint not found at: $path")
 		# println("   Initializing fresh random networks.")
 		return (
 			representation = init_representation(hyper, conf),
@@ -29,7 +29,7 @@ function load_networks(conf, step)
 		)
 	end
 
-	# println("✅ Loading networks from: $path")
+	# println("Loading networks from: $path")
 	model_data = load(path)
 	return (
 		representation = model_data["representation"],
@@ -42,7 +42,7 @@ NNs = load_networks(conf, LOAD_STEP)
 env = Connect4()
 
 println("\n" * "="^40)
-println(" 🔴 Connect 4 MuZero Agent")
+println(" Connect 4 MuZero Agent")
 println("="^40)
 println("You are Player 1.")
 println("Enter column (1-7) to play.")

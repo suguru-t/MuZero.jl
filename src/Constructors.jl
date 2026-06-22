@@ -30,8 +30,8 @@ end
 	max_moves::Int # Game dependent
 	temperature_threshold::Union{Int, Nothing} = nothing # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
 
-	dirichlet_α::Float32 = 0.25
-	exploration_ϵ::Float32 = 0.25
+	dirichlet_alpha::Float32 = 0.25
+	exploration_epsilon::Float32 = 0.25
 	pb_c_base::Int = 19652
 	pb_c_init::Float32 = 1.25
 	discount::Float32 = 0.997 # Chronological discount of the reward

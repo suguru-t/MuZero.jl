@@ -30,7 +30,7 @@ const hyper = FeedForwardHP(
 	depth_value = 2,
 	depth_reward = 2,
 	depth_state_head = 2,
-	use_batch_norm = true,     # ← これを追加！
+	use_batch_norm = true,
 	hidden_state_size = 126, # 6*7*3 = 126      
 	reward_activation = tanh,
 )

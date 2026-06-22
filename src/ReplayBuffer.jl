@@ -23,7 +23,7 @@ end
 
 function make_target(history::GameHistory, state_index::Int, conf::Config)::Tuple{Vector{Float32}, Vector{Float32}, Array{Float32, 2}, Vector{Int}}
 	target_values, target_rewards, target_policies, actions = Vector{Float32}(), Vector{Float32}(), Matrix{Float32}(undef, length(conf.action_space), 0), Vector{Int}()
-	for current_index ∈ state_index:(state_index+conf.num_unroll_steps)
+	for current_index in state_index:(state_index+conf.num_unroll_steps)
 		if current_index < length(history.root_values)
 			value = compute_target_value(history, current_index, conf)
 			append!(target_values, value)
@@ -121,22 +121,25 @@ function insert_game!(buffer::Dict{Int, GameHistory}, history::GameHistory, next
 	end
 end
 
-function update_priorities!(buffer::Dict{Int, GameHistory}, priorities::Matrix{Float32}, index_batch::AbstractVector)::Nothing
-	for i ∈ 1:length(index_batch)
+function update_priorities!(buffer::Dict{Int, GameHistory}, priorities::Matrix{Float32}, index_batch::AbstractVector{Tuple{Int, Int}})::Nothing
+	for i in eachindex(index_batch)
 		game_id, game_pos = index_batch[i]
 		if haskey(buffer, game_id)
+			maybe_priorities = buffer[game_id].priorities
+			if isnothing(maybe_priorities)
+				continue
+			end
+			stored_priorities = maybe_priorities::Vector{Float32}
+
 			priority = priorities[:, i]
 			start_index = game_pos
-			# FIX: Ensure we don't go past the end of the game history AND don't read past the end of the priority update vector
-			# The available updates are limited by the length of 'priority' vector (usually num_unroll_steps + 1)
-			end_index = min(game_pos + length(priority) - 1, length(buffer[game_id].priorities))
+			end_index = min(game_pos + size(priorities, 1) - 1, lastindex(stored_priorities))
 
-			# Calculate how many elements we are actually updating
 			update_len = end_index - start_index + 1
 
 			if update_len > 0
-				buffer[game_id].priorities[start_index:end_index] = priority[1:update_len]
-				buffer[game_id].game_priority = maximum(buffer[game_id].priorities)
+				stored_priorities[start_index:end_index] = priority[1:update_len]
+				buffer[game_id].game_priority = maximum(stored_priorities)
 			end
 		end
 	end

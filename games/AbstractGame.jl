@@ -3,7 +3,7 @@
 Inherit this class for muzero to play
 """
 struct Game
-    board::Array <: Any
+    board::Array
     player::Int
 end
 
@@ -74,11 +74,12 @@ Returns:
 An integer from the action space.
 """
 function human_to_action()
-    choice = input("Enter the action to play for the player {to_play()}: ")
-    while int(choice) ∉ legal_actions()
-        choice = input("Ilegal action. Enter another action : ")
+    choice = parse(Int, readline())
+    while !(choice in legal_actions())
+        println("Illegal action. Enter another action: ")
+        choice = parse(Int, readline())
     end
-    return int(choice)
+    return choice
 end
 
 """
