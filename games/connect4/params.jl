@@ -12,17 +12,20 @@ const conf = Config(
 	PER = true,
 	opponent = "human",
 	training_steps = 50000,
-	batch_size = 128,
+	batch_size = 64,
 	num_iters = 100,
 	checkpoint_interval = 500,
-	# FIX: Enable reward learning
-	intermediate_rewards = false,
+	temperature_initial = 1.0f0,
+	temperature_final = 1.0f0,
+	temperature_decay_steps = 10000,
+	temperature_threshold = 30,
+	intermediate_rewards = true,
 	results_path = mkpath(joinpath(GAME_DIR, "results")),
 	networks_path = mkpath(joinpath(GAME_DIR, "networks")),
 )
 
 const hyper = FeedForwardHP(
-	width_hidden = 64,  # Increased from 16 to 64 for better learning capacity          
+	width_hidden = 64,
 	depth_representation = 4,
 	depth_prediction = 4,
 	depth_dynamics = 4,
@@ -31,6 +34,6 @@ const hyper = FeedForwardHP(
 	depth_reward = 2,
 	depth_state_head = 2,
 	use_batch_norm = true,
-	hidden_state_size = 126, # 6*7*3 = 126      
+	hidden_state_size = 126,
 	reward_activation = tanh,
 )

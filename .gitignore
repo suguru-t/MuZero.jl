@@ -72,3 +72,7 @@ venv.bak/
 events.out.*
 *DS_Store
 .DS_Store
+
+# Generated training/evaluation outputs
+games/*/results/
+games/*/networks/

@@ -7,16 +7,20 @@ future, plus the discounted sum of all rewards until then.
 """
 function compute_target_value(history::GameHistory, index::Int, conf::Config)::Float32
 	bootstrap_index = index + conf.td_steps
-	if bootstrap_index < length(history.root_values)
-		root_values = (isnothing(history.reanalysed_predicted_root_values) ? history.root_values : history.reanalysed_predicted_root_values)
-		last_step_value = (history.to_play_history[bootstrap_index] == history.to_play_history[index] ? root_values[bootstrap_index] : -root_values[bootstrap_index])
-		value = last_step_value * conf.discount^conf.td_steps
-		for (i, reward) in enumerate(history.reward_history[index:bootstrap_index])
-			# The value is oriented from the perspective of the current player
-			value += (history.to_play_history[index] == history.to_play_history[index+i] ? reward : -reward) * conf.discount^i
-		end
-	else
-		value = 0.0f0
+	current_player = history.to_play_history[index]
+	value = 0.0f0
+
+	last_reward_index = min(bootstrap_index - 1, length(history.reward_history))
+	for reward_index in index:last_reward_index
+		reward = history.reward_history[reward_index]
+		signed_reward = history.to_play_history[reward_index] == current_player ? reward : -reward
+		value += signed_reward * conf.discount^(reward_index - index)
+	end
+
+	if bootstrap_index <= length(history.root_values)
+		root_values = isnothing(history.reanalysed_predicted_root_values) ? history.root_values : history.reanalysed_predicted_root_values
+		bootstrap_value = history.to_play_history[bootstrap_index] == current_player ? root_values[bootstrap_index] : -root_values[bootstrap_index]
+		value += bootstrap_value * conf.discount^(bootstrap_index - index)
 	end
 	return value
 end
@@ -24,20 +28,18 @@ end
 function make_target(history::GameHistory, state_index::Int, conf::Config)::Tuple{Vector{Float32}, Vector{Float32}, Array{Float32, 2}, Vector{Int}}
 	target_values, target_rewards, target_policies, actions = Vector{Float32}(), Vector{Float32}(), Matrix{Float32}(undef, length(conf.action_space), 0), Vector{Int}()
 	for current_index in state_index:(state_index+conf.num_unroll_steps)
-		if current_index < length(history.root_values)
+		if current_index <= length(history.root_values)
 			value = compute_target_value(history, current_index, conf)
 			append!(target_values, value)
-			append!(target_rewards, history.reward_history[current_index])
+			reward = current_index == state_index ? 0.0f0 : history.reward_history[current_index-1]
+			append!(target_rewards, reward)
 			target_policies = hcat(target_policies, history.child_visits[:, current_index])
-			append!(actions, history.action_history[current_index])
-		elseif current_index == length(history.root_values)
-			append!(target_values, 0)
-			append!(target_rewards, history.reward_history[current_index])
-			target_policies = hcat(target_policies, fill(1.0f0 / length(conf.action_space), length(conf.action_space)))
 			append!(actions, history.action_history[current_index])
 		else
 			append!(target_values, 0)
-			append!(target_rewards, 0)
+			reward_index = current_index - 1
+			reward = reward_index <= length(history.reward_history) ? history.reward_history[reward_index] : 0.0f0
+			append!(target_rewards, reward)
 			target_policies = hcat(target_policies, fill(1.0f0 / length(conf.action_space), length(conf.action_space)))
 			append!(actions, rand(rng, conf.action_space))
 		end
@@ -45,10 +47,22 @@ function make_target(history::GameHistory, state_index::Int, conf::Config)::Tupl
 	return target_values, target_rewards, target_policies, actions
 end
 
+function normalize_probs(values::AbstractVector{<:Real})::Vector{Float32}
+	probs = Float32.(values)
+	total = sum(probs)
+	if isempty(probs)
+		return Float32[]
+	end
+	if !isfinite(total) || total <= 0 || !all(isfinite, probs)
+		return fill(1.0f0 / length(probs), length(probs))
+	end
+	return probs ./ total
+end
+
 function sample_position(history::GameHistory, conf::Config; force_uniform = false)::Tuple{Int, Float32}
 	position_prob = 0.0f0
 	if conf.PER && !force_uniform
-		position_probs = history.priorities ./ sum(history.priorities)
+		position_probs = normalize_probs(history.priorities)
 		position_index = rand(rng, Categorical(position_probs))
 		position_prob = position_probs[position_index]
 	else
@@ -65,13 +79,12 @@ function sample_n_games(buffer::Dict{Int, GameHistory}, conf::Config; force_unif
 			append!(game_id_list, game_id)
 			push!(game_probs, history.game_priority)
 		end
-		game_probs ./= sum(game_probs)
+		game_probs = normalize_probs(game_probs)
 		game_prob_dict = Dict(game_id => prob for (game_id, prob) in zip(game_id_list, game_probs))
 		selected_games = [game_id_list[i] for i in rand(rng, Categorical(game_probs), conf.batch_size)]
 		n_games = [(game_id, buffer[game_id], game_prob_dict[game_id]) for game_id in selected_games]
 	else
 		selected_games = rand(collect(keys(buffer)), conf.batch_size)
-		game_prob_dict = Dict()
 		n_games = [(game_id, buffer[game_id], 0.0f0) for game_id in selected_games]
 	end
 	return n_games
@@ -84,7 +97,7 @@ function sample_game(buffer::Dict{Int, GameHistory}, num_played_games_count::Int
 		for (_, history) in buffer
 			append!(game_probs, history.game_priority)
 		end
-		game_probs ./= sum(game_probs)
+		game_probs = normalize_probs(game_probs)
 		game_index = rand(rng, Categorical(game_probs))
 		game_prob = game_probs[game_index]
 	else
@@ -105,14 +118,15 @@ function insert_game!(buffer::Dict{Int, GameHistory}, history::GameHistory, next
 			priority = abs(root_value - compute_target_value(history, i, conf))^conf.PER_alpha
 			append!(priorities, priority)
 		end
+		if isempty(priorities) || !all(isfinite, priorities) || sum(priorities) <= 0
+			priorities = fill(1.0f0, length(history.root_values))
+		end
 		history.priorities = priorities
 		history.game_priority = maximum(history.priorities)
 	end
 
 	buffer[next_game_id] = history
 
-	# Maintain buffer size limit
-	# We remove the oldest game ID. Since IDs are incremental, oldest is (next_id - current_size)
 	if length(buffer) > conf.replay_buffer_size
 		oldest_id = next_game_id - conf.replay_buffer_size
 		if haskey(buffer, oldest_id)
@@ -134,7 +148,6 @@ function update_priorities!(buffer::Dict{Int, GameHistory}, priorities::Matrix{F
 			priority = priorities[:, i]
 			start_index = game_pos
 			end_index = min(game_pos + size(priorities, 1) - 1, lastindex(stored_priorities))
-
 			update_len = end_index - start_index + 1
 
 			if update_len > 0
@@ -147,7 +160,6 @@ end
 
 function get_batch(buffer::Dict{Int, GameHistory}, conf::Config)::Tuple{Vector{Tuple{Int, Int}}, Tuple{Array{Float32, 4}, Matrix{Float32}, Matrix{Float32}, Matrix{Float32}, Array{Float32, 3}, Any, Vector{Float32}}}
 	total_samples = sum([length(history.root_values) for history in values(buffer)])
-	# Store (game_id, position_index) as integers
 	index_batch = Vector{Tuple{Int, Int}}()
 	observation_batch = Array{Float32}(undef, conf.observation_shape[1], conf.observation_shape[2], (conf.observation_shape[3]*(conf.stacked_observations+1)+conf.stacked_observations), 0)
 	action_batch = Array{Float32}(undef, conf.num_unroll_steps+1, 0)
@@ -169,6 +181,9 @@ function get_batch(buffer::Dict{Int, GameHistory}, conf::Config)::Tuple{Vector{T
 		push!(gradient_scale_batch, min(conf.num_unroll_steps, length(history.action_history)+1 - game_pos))
 		conf.PER ? push!(weight_batch, 1 / (total_samples * game_prob * pos_prob)) : nothing
 	end
-	conf.PER ? weight_batch ./= maximum(weight_batch) : nothing
+	if conf.PER
+		max_weight = maximum(weight_batch)
+		weight_batch = (!isfinite(max_weight) || max_weight <= 0) ? ones(Float32, length(weight_batch)) : weight_batch ./ max_weight
+	end
 	return index_batch, (observation_batch, action_batch, value_batch, reward_batch, policy_batch, weight_batch, gradient_scale_batch)
 end

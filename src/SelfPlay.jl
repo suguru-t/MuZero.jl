@@ -9,8 +9,7 @@ insert_singleton_dim(xs::AbstractArray, dim::Integer) = reshape(xs, (size(xs)[1:
 function make_state_action(state::Array{Float32, 3}, action::Int, conf::Config)::Array{Float32, 3}
 	norm_action = action / length(conf.action_space)
 	action_plane = fill(Float32(norm_action), (conf.observation_shape[1], conf.observation_shape[2], 1))
-	scaled_state = state .* 2.0f0
-	state_action = cat(scaled_state, action_plane, dims = 3)
+	state_action = cat(state, action_plane, dims = 3)
 	return state_action
 end
 
@@ -33,13 +32,20 @@ function normalize_tree_value(treeminmax::MinMaxStats, value::Float32)::Float32
 	end
 end
 
+function visit_softmax_temperature_fn(trained_steps::Int, conf::Config)::Float32
+	decay_steps = isnothing(conf.temperature_decay_steps) ? conf.training_steps : conf.temperature_decay_steps
+	decay_steps = max(decay_steps, 1)
+	progress = clamp(Float32(trained_steps) / Float32(decay_steps), 0.0f0, 1.0f0)
+	return conf.temperature_initial + progress * (conf.temperature_final - conf.temperature_initial)
+end
+
 function visit_softmax_temperature_fn(trained_steps::Int)::Float32
-	if trained_steps < 500e3
-		return 1.0
-	elseif trained_steps < 750e3
-		return 0.5
+	if trained_steps < 500_000
+		return 1.0f0
+	elseif trained_steps < 750_000
+		return 0.5f0
 	else
-		return 0.25
+		return 0.25f0
 	end
 end
 
@@ -61,6 +67,15 @@ function expanded(node::Node)::Bool
 	return !isnothing(node.children)
 end
 
+function sanitize_mcts_value(x, conf::Config, context::String)::Float32
+	value = Float32(x)
+	if isfinite(value)
+		return value
+	end
+	conf.allow_nonfinite_mcts && return 0.0f0
+	error("$context became non-finite during MCTS: $value")
+end
+
 function node_value(node::Node)::Float32
 	if node.visit_count == 0
 		return 0
@@ -69,13 +84,39 @@ function node_value(node::Node)::Float32
 	end
 end
 
-function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state)
-	policy_values = softmax(Float32[policy_logits[a] for a in actions])
+function node_value(node::Node, conf::Config)::Float32
+	return sanitize_mcts_value(node_value(node), conf, "node value")
+end
+
+function safe_policy_values(policy_logits::Vector{Float32}, actions, conf::Config)::Vector{Float32}
+	selected_logits = Float32[policy_logits[a] for a in actions]
+	if isempty(selected_logits)
+		return Float32[]
+	end
+	if !all(isfinite, selected_logits)
+		conf.allow_nonfinite_mcts || error("policy logits became non-finite during MCTS")
+		return fill(1.0f0 / length(selected_logits), length(selected_logits))
+	end
+	policy_values = softmax(selected_logits)
+	if !all(isfinite, policy_values) || sum(policy_values) <= 0
+		conf.allow_nonfinite_mcts || error("policy probabilities became non-finite during MCTS")
+		return fill(1.0f0 / length(selected_logits), length(selected_logits))
+	end
+	return Float32.(policy_values ./ sum(policy_values))
+end
+
+function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state, conf::Config)
+	policy_values = safe_policy_values(policy_logits, actions, conf)
 	policy = Dict([(a, policy_values[i]) for (i, a) in enumerate(actions)])
 	node.children = Dict([(action, Node(prior = prob)) for (action, prob) in policy])
 	node.to_play = Int(to_play)
-	node.reward = Float32(reward)
-	node.hidden_state = Array{Float32, 3}(hidden_state)
+	node.reward = sanitize_mcts_value(reward, conf, "reward")
+	hidden_state_array = Array{Float32, 3}(hidden_state)
+	if !all(isfinite, hidden_state_array)
+		conf.allow_nonfinite_mcts || error("hidden state became non-finite during MCTS")
+		hidden_state_array = sanitize_mcts_value.(hidden_state_array, Ref(conf), Ref("hidden state"))
+	end
+	node.hidden_state = hidden_state_array
 	return nothing
 end
 
@@ -88,13 +129,18 @@ function add_exploration_noise!(node::Node, dirichlet_alpha::Float32, exploratio
 	return nothing
 end
 
-function store_search_stats!(history::GameHistory, root::Node, action_space::Array{Int})
+function store_search_stats!(history::GameHistory, root::Node, action_space::Array{Int}, conf::Config)
 	children=collect(values(root.children))
 	children=filter!(x->!isnothing(x), children)
 	sum_visits = sum([child.visit_count for child in children])
 	history.child_visits = hcat(history.child_visits, [haskey(root.children, a) ? root.children[a].visit_count / sum_visits : 0.0f0 for a in action_space])
-	value=node_value(root)
+	value=node_value(root, conf)
 	append!(history.root_values, value)
+end
+
+function store_unsearched_stats!(history::GameHistory, action_space::Array{Int})
+	history.child_visits = hcat(history.child_visits, fill(1.0f0 / length(action_space), length(action_space)))
+	append!(history.root_values, 0.0f0)
 end
 
 function get_stacked_observations(history::GameHistory, index::Int, num_stacked_observations::Int, conf::Config)::Array{Float32, 3}
@@ -123,12 +169,19 @@ using Random
 global rng = MersenneTwister(1234)
 
 function select_child(node::Node, treeminmax::MinMaxStats, conf::Config)::Tuple{Int, Node}
-	actions = collect(keys(node.children))
-	if isempty(actions)
+	entries = collect(node.children)
+	if isempty(entries)
 		error("Cannot select a child from an unexpanded node.")
 	end
-	children = collect(values(node.children))
+	actions = [entry.first for entry in entries]
+	children = [entry.second for entry in entries]
 	ucb_scores = [ucb_score(node, child, treeminmax, conf) for child in children]
+	if !any(isfinite, ucb_scores)
+		conf.allow_nonfinite_mcts || error("all UCB scores became non-finite during MCTS")
+		i = rand(eachindex(children))
+		return actions[i], children[i]
+	end
+	ucb_scores = [isfinite(score) ? score : -Inf32 for score in ucb_scores]
 	max_ucb = maximum(ucb_scores)
 	max_ucbs = findall(x -> x == max_ucb, ucb_scores)
 	i = rand(max_ucbs)
@@ -143,11 +196,11 @@ function ucb_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, conf
 	prior_score = pb_c * child.prior
 
 	if child.visit_count > 0
-		value_score = normalize_tree_value(treeminmax, child.reward + (conf.discount * (length(conf.players) == 1 ? node_value(child) : -node_value(child))))
+		value_score = normalize_tree_value(treeminmax, child.reward + (conf.discount * (length(conf.players) == 1 ? node_value(child, conf) : -node_value(child, conf))))
 	else
 		value_score = 0
 	end
-	return prior_score + value_score
+	return sanitize_mcts_value(prior_score + value_score, conf, "UCB score")
 end
 
 function backpropagate!(search_path::Vector{Node}, value::Float32, to_play::Int, treeminmax::MinMaxStats, conf::Config)::Nothing
@@ -155,23 +208,15 @@ function backpropagate!(search_path::Vector{Node}, value::Float32, to_play::Int,
 		for node in reverse(search_path)
 			node.value_sum += value
 			node.visit_count += 1
-			update_tree!(treeminmax, node.reward + conf.discount * node_value(node))
+			update_tree!(treeminmax, node.reward + conf.discount * node_value(node, conf))
 			value = node.reward + conf.discount * value
 		end
 	elseif length(conf.players) == 2
 		for node in reverse(search_path)
-			if node.to_play == to_play
-				node.value_sum += value
-			else
-				node.value_sum -= value
-			end
+			node.value_sum += value
 			node.visit_count += 1
-			update_tree!(treeminmax, node.reward + conf.discount * node_value(node))
-			if node.to_play == to_play
-				value = -node.reward
-			else
-				value = node.reward + conf.discount * value
-			end
+			update_tree!(treeminmax, node.reward - conf.discount * node_value(node, conf))
+			value = node.reward - conf.discount * value
 		end
 	else
 		ErrorException("backpropagate for more than 2 players is not implemented")
@@ -197,7 +242,7 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		error("Legal actions should not be an empty array. Got $(legal_actions)")
 	end
 	@assert issubset(Set(legal_actions), Set(conf.action_space)) "Legal actions should be a subset of the action space."
-	expand_node!(root, legal_actions, to_play, reward, policy_logits_vector, hidden_state_array)
+	expand_node!(root, legal_actions, to_play, reward, policy_logits_vector, hidden_state_array, conf)
 
 	if exploration
 		add_exploration_noise!(root, conf.dirichlet_alpha, conf.exploration_epsilon)
@@ -233,7 +278,7 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		value, policy_logits = drop_singleton_dims.([value, policy_logits])
 		policy_logits = vec(Float32.(policy_logits))
 
-		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state)
+		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state, conf)
 		backpropagate!(search_path, value[1], virtual_to_play, treeminmax, conf)
 		max_tree_depth = maximum([max_tree_depth, current_tree_depth])
 	end
@@ -241,8 +286,9 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 end
 
 function select_action(node::Node, temperature::Real)::Int
-	visit_counts = Int32[child.visit_count for child in values(node.children)]
-	actions = [action for action in keys(node.children)]
+	entries = collect(node.children)
+	actions = [entry.first for entry in entries]
+	visit_counts = Int32[entry.second.visit_count for entry in entries]
 	if temperature == 0.0f0
 		action = actions[argmax(visit_counts)]
 	elseif temperature == Inf
@@ -293,6 +339,7 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 		p = ReinforcementLearningBase.current_player(env)
 		history.observation_history = cat(history.observation_history, observation, dims = 4)
 		stacked_observations = get_stacked_observations(history, lastindex(history.observation_history, 4), conf.stacked_observations, conf)
+		root = nothing
 
 		action = if opponent == "self" || muzero_player == p
 			root = run_mcts(stacked_observations, ReinforcementLearningBase.legal_action_space(env, p), p, true, NNs, conf)
@@ -310,7 +357,11 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 			render_game(env)
 		end
 
-		store_search_stats!(history, root, conf.action_space)
+		if isnothing(root)
+			store_unsearched_stats!(history, conf.action_space)
+		else
+			store_search_stats!(history, root, conf.action_space, conf)
+		end
 		append!(history.action_history, action)
 		append!(history.reward_history, reward)
 		push!(history.to_play_history, p)
@@ -319,42 +370,52 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 end
 
 function self_play!(env, training_step, remote_NNs, game_queue::RemoteChannel, conf::Config)::Bool
-	NNs = fetch(remote_NNs)
+	NNs = set_inference_mode!(fetch(remote_NNs))
 	last_network_update_step = 0
 	last_sync_time = time()
 	SYNC_INTERVAL = 2.0
 
-	while true
-		if time() - last_sync_time > SYNC_INTERVAL
+	try
+		while true
+			if time() - last_sync_time > SYNC_INTERVAL
+				current_step = fetch(training_step)
+
+				if current_step > conf.training_steps
+					break
+				end
+
+				if current_step > last_network_update_step + conf.checkpoint_interval
+					NNs = set_inference_mode!(fetch(remote_NNs))
+					last_network_update_step = current_step
+					# @info "Networks synced in SelfPlay (Step: $current_step)" 
+				end
+
+				last_sync_time = time()
+			end
+
 			current_step = fetch(training_step)
+			temperature = visit_softmax_temperature_fn(current_step, conf)
 
-			if current_step > conf.training_steps
-				break
-			end
+			history = play_game(
+				env,
+				temperature,
+				false,
+				"self",
+				conf.muzero_player,
+				NNs,
+				conf,
+			)
 
-			if current_step > last_network_update_step + conf.checkpoint_interval
-				NNs = fetch(remote_NNs)
-				last_network_update_step = current_step
-				# @info "Networks synced in SelfPlay (Step: $current_step)" 
-			end
-
-			last_sync_time = time()
+			put!(game_queue, history)
 		end
-
-		current_step = fetch(training_step)
-		temperature = visit_softmax_temperature_fn(current_step)
-
-		history = play_game(
-			env,
-			temperature,
-			false,
-			"self",
-			conf.muzero_player,
-			NNs,
-			conf,
-		)
-
-		put!(game_queue, history)
+	catch err
+		step_text = try
+			string(fetch(training_step))
+		catch
+			"unknown"
+		end
+		details = sprint(showerror, err, catch_backtrace())
+		error("Self-play worker $(myid()) failed at training step $step_text with last synced checkpoint step $last_network_update_step:\n$details")
 	end
 	return true
 end

@@ -29,6 +29,10 @@ end
 	selfplay_on_gpu::Bool = false
 	max_moves::Int # Game dependent
 	temperature_threshold::Union{Int, Nothing} = nothing # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
+	temperature_initial::Float32 = 1.0f0
+	temperature_final::Float32 = 0.25f0
+	temperature_decay_steps::Union{Int, Nothing} = nothing
+	allow_nonfinite_mcts::Bool = false
 
 	dirichlet_alpha::Float32 = 0.25
 	exploration_epsilon::Float32 = 0.25

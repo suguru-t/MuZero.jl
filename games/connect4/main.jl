@@ -144,20 +144,18 @@ self_play_pids = dedicated_ids
 # println("   Learner PID:   $learner_pid")
 # println("   Self-Play PIDs: $self_play_pids")
 
+self_play_jobs = NamedTuple[]
+
 # println("Starting Self-Play...")
 for pid in self_play_pids
-	@spawnat pid begin
-		try
-			# Updated signature: No counters, use game_queue
-			self_play!(env,
-				training_step,
-				remote_NNs,
-				game_queue,
-				conf)
-		catch e
-			println("Worker $pid failed: $e")
-		end
+	future = @spawnat pid begin
+		self_play!(env,
+			training_step,
+			remote_NNs,
+			game_queue,
+			conf)
 	end
+	push!(self_play_jobs, (pid = pid, future = future))
 end
 
 # println("Starting Learner...")
@@ -168,8 +166,48 @@ learn = @spawnat learner_pid learning!(
 	conf,
 	hyper)
 
+function current_training_step_text(training_step)
+	try
+		return string(fetch(training_step))
+	catch
+		return "unknown"
+	end
+end
+
+function wait_for_training!(learn, self_play_jobs, training_step, conf)
+	completed_self_play_workers = Set{Int}()
+	while true
+		if isready(learn)
+			fetch(learn)
+			return true
+		end
+
+		for job in self_play_jobs
+			job.pid in completed_self_play_workers && continue
+
+			if isready(job.future)
+				try
+					fetch(job.future)
+				catch err
+					step_text = current_training_step_text(training_step)
+					details = sprint(showerror, err, catch_backtrace())
+					error("Self-play worker $(job.pid) failed while learner was active at training step $step_text:\n$details")
+				end
+				step_text = current_training_step_text(training_step)
+				if tryparse(Int, step_text) !== nothing && parse(Int, step_text) > conf.training_steps
+					push!(completed_self_play_workers, job.pid)
+				else
+					error("Self-play worker $(job.pid) exited before learner completed at training step $step_text")
+				end
+			end
+		end
+
+		sleep(1.0)
+	end
+end
+
 try
-	wait(learn)
+	wait_for_training!(learn, self_play_jobs, training_step, conf)
 catch e
 	if e isa InterruptException
 		println("\nTraining stopped by user.")
@@ -181,12 +219,12 @@ catch e
 			log_path = joinpath(conf.results_path, "learner_error.log")
 			open(log_path, "w") do io
 				println(io, "\n" * "="^60)
-				println(io, "TIMESTAMP: $(now())")
-				println(io, "ERROR TYPE: $(typeof(e))")
-				println(io, "-"^30)
-				showerror(io, e)
-				println(io, "\n" * "="^60)
-			end
+			println(io, "TIMESTAMP: $(now())")
+			println(io, "ERROR TYPE: $(typeof(e))")
+			println(io, "-"^30)
+			showerror(io, e, catch_backtrace())
+			println(io, "\n" * "="^60)
+		end
 			println("Error details saved to: $log_path")
 		catch log_err
 			println("Failed to write error log: $log_err")
