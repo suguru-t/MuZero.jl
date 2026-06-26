@@ -57,6 +57,7 @@ using Flux: softmax
 	visit_count::Int = 0
 	to_play::Int = 1
 	prior::Float32
+	value_prior::Float32 = 0.0f0
 	value_sum::Float32 = 0.0
 	children::Union{Dict{Int, Node}, Nothing} = nothing
 	hidden_state::Union{Array{Float32, 3}, Nothing} = nothing
@@ -105,12 +106,13 @@ function safe_policy_values(policy_logits::Vector{Float32}, actions, conf::Confi
 	return Float32.(policy_values ./ sum(policy_values))
 end
 
-function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state, conf::Config)
+function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state, conf::Config; value_prior = 0.0f0)
 	policy_values = safe_policy_values(policy_logits, actions, conf)
 	policy = Dict([(a, policy_values[i]) for (i, a) in enumerate(actions)])
 	node.children = Dict([(action, Node(prior = prob)) for (action, prob) in policy])
 	node.to_play = Int(to_play)
 	node.reward = sanitize_mcts_value(reward, conf, "reward")
+	node.value_prior = sanitize_mcts_value(value_prior, conf, "value prior")
 	hidden_state_array = Array{Float32, 3}(hidden_state)
 	if !all(isfinite, hidden_state_array)
 		conf.allow_nonfinite_mcts || error("hidden state became non-finite during MCTS")
@@ -175,17 +177,22 @@ function select_child(node::Node, treeminmax::MinMaxStats, conf::Config)::Tuple{
 	end
 	actions = [entry.first for entry in entries]
 	children = [entry.second for entry in entries]
-	ucb_scores = [ucb_score(node, child, treeminmax, conf) for child in children]
-	if !any(isfinite, ucb_scores)
-		conf.allow_nonfinite_mcts || error("all UCB scores became non-finite during MCTS")
+	scores = [search_score(node, child, treeminmax, conf) for child in children]
+	if !any(isfinite, scores)
+		conf.allow_nonfinite_mcts || error("all search scores became non-finite during MCTS")
 		i = rand(eachindex(children))
 		return actions[i], children[i]
 	end
-	ucb_scores = [isfinite(score) ? score : -Inf32 for score in ucb_scores]
-	max_ucb = maximum(ucb_scores)
-	max_ucbs = findall(x -> x == max_ucb, ucb_scores)
-	i = rand(max_ucbs)
+	scores = [isfinite(score) ? score : -Inf32 for score in scores]
+	max_score = maximum(scores)
+	max_scores = findall(x -> x == max_score, scores)
+	i = rand(max_scores)
 	return actions[i], children[i]
+end
+
+function child_value_from_parent(child::Node, conf::Config)::Float32
+	value = child.reward + conf.discount * (length(conf.players) == 1 ? node_value(child, conf) : -node_value(child, conf))
+	return sanitize_mcts_value(value, conf, "child value")
 end
 
 function ucb_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, conf::Config)::Float32
@@ -196,11 +203,31 @@ function ucb_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, conf
 	prior_score = pb_c * child.prior
 
 	if child.visit_count > 0
-		value_score = normalize_tree_value(treeminmax, child.reward + (conf.discount * (length(conf.players) == 1 ? node_value(child, conf) : -node_value(child, conf))))
+		value_score = normalize_tree_value(treeminmax, child_value_from_parent(child, conf))
 	else
 		value_score = 0
 	end
 	return sanitize_mcts_value(prior_score + value_score, conf, "UCB score")
+end
+
+function rs_score(parent_node::Node, child::Node, conf::Config)::Float32
+	parent_visit_count = parent_node.visit_count + 1
+	parent_value_sum = parent_node.value_prior / 2 + parent_node.value_sum
+	parent_mean_value = parent_value_sum / parent_visit_count
+
+	child_visit_count = child.visit_count + 1
+	child_value_sum = child.visit_count > 0 ? child.visit_count * child_value_from_parent(child, conf) : 0.0f0
+	score_value_sum = parent_mean_value + child_value_sum
+	rs = child_visit_count * (score_value_sum / child_visit_count - conf.rs_R) / parent_visit_count
+	return sanitize_mcts_value(rs, conf, "RS score")
+end
+
+function search_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, conf::Config)::Float32
+	if conf.use_rs
+		return rs_score(parent_node, child, conf)
+	else
+		return ucb_score(parent_node, child, treeminmax, conf)
+	end
 end
 
 function backpropagate!(search_path::Vector{Node}, value::Float32, to_play::Int, treeminmax::MinMaxStats, conf::Config)::Nothing
@@ -242,7 +269,7 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		error("Legal actions should not be an empty array. Got $(legal_actions)")
 	end
 	@assert issubset(Set(legal_actions), Set(conf.action_space)) "Legal actions should be a subset of the action space."
-	expand_node!(root, legal_actions, to_play, reward, policy_logits_vector, hidden_state_array, conf)
+	expand_node!(root, legal_actions, to_play, reward, policy_logits_vector, hidden_state_array, conf; value_prior = root_predicted_value[1])
 
 	if exploration
 		add_exploration_noise!(root, conf.dirichlet_alpha, conf.exploration_epsilon)
@@ -278,7 +305,7 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		value, policy_logits = drop_singleton_dims.([value, policy_logits])
 		policy_logits = vec(Float32.(policy_logits))
 
-		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state, conf)
+		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state, conf; value_prior = value[1])
 		backpropagate!(search_path, value[1], virtual_to_play, treeminmax, conf)
 		max_tree_depth = maximum([max_tree_depth, current_tree_depth])
 	end

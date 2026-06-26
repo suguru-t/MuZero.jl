@@ -133,6 +133,20 @@ include(joinpath(GAME_DIR, "params.jl"))
 		@test isapprox(node_value(root), 1.0f0 - 0.9f0 * 0.4f0)
 	end
 
+	@testset "Fixed aspiration RS search score" begin
+		test_conf = Config(conf; use_rs = true, rs_R = 0.6f0, discount = 1.0f0)
+		root = Node(prior = 0.0f0, to_play = 1, value_prior = 0.8f0, visit_count = 3, value_sum = 1.2f0)
+		child = Node(prior = 1.0f0, to_play = 2, reward = 0.0f0, visit_count = 2, value_sum = -1.0f0)
+		stats = MinMaxStats(Inf32, -Inf32)
+
+		parent_mean = (root.value_prior / 2 + root.value_sum) / (root.visit_count + 1)
+		child_value = child.reward - test_conf.discount * node_value(child, test_conf)
+		expected = (child.visit_count + 1) * ((parent_mean + child.visit_count * child_value) / (child.visit_count + 1) - test_conf.rs_R) / (root.visit_count + 1)
+
+		@test isapprox(rs_score(root, child, test_conf), expected)
+		@test isapprox(search_score(root, child, stats, test_conf), expected)
+	end
+
 	@testset "Reward loss is always learned" begin
 		test_conf = Config(conf; intermediate_rewards = false, batch_size = 2, num_unroll_steps = 1)
 		value = zeros(Float32, 2, 2)

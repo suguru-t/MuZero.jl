@@ -38,6 +38,8 @@ end
 	exploration_epsilon::Float32 = 0.25
 	pb_c_base::Int = 19652
 	pb_c_init::Float32 = 1.25
+	use_rs::Bool = false
+	rs_R::Float32 = 0.6f0
 	discount::Float32 = 0.997 # Chronological discount of the reward
 	num_iters::Int # Number of future moves self-simulated
 
