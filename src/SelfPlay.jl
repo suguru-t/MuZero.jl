@@ -57,6 +57,7 @@ using Flux: softmax
 	visit_count::Int = 0
 	to_play::Int = 1
 	prior::Float32
+	# 展開時のネットワーク価値。RSではAlphaZeRSのノード初期価値として使う。
 	value_prior::Float32 = 0.0f0
 	value_sum::Float32 = 0.0
 	children::Union{Dict{Int, Node}, Nothing} = nothing
@@ -177,6 +178,7 @@ function select_child(node::Node, treeminmax::MinMaxStats, conf::Config)::Tuple{
 	end
 	actions = [entry.first for entry in entries]
 	children = [entry.second for entry in entries]
+	# 設定に応じて通常のMuZero UCBか、固定希求水準RSで子ノードを評価する。
 	scores = [search_score(node, child, treeminmax, conf) for child in children]
 	if !any(isfinite, scores)
 		conf.allow_nonfinite_mcts || error("all search scores became non-finite during MCTS")
@@ -211,10 +213,13 @@ function ucb_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, conf
 end
 
 function rs_score(parent_node::Node, child::Node, conf::Config)::Float32
+	# AlphaZeRSでは展開済みノードを n_all = 1, q_sum_all = v / 2 で初期化している。
+	# MuZero側では訪問数と価値和を直接持つため、ここで同じ基準値を再構成する。
 	parent_visit_count = parent_node.visit_count + 1
 	parent_value_sum = parent_node.value_prior / 2 + parent_node.value_sum
 	parent_mean_value = parent_value_sum / parent_visit_count
 
+	# RS = n * (Q_mean - R) / n_all。子の価値はUCBの価値項と同じく親視点へ変換する。
 	child_visit_count = child.visit_count + 1
 	child_value_sum = child.visit_count > 0 ? child.visit_count * child_value_from_parent(child, conf) : 0.0f0
 	score_value_sum = parent_mean_value + child_value_sum
