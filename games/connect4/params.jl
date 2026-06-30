@@ -14,16 +14,22 @@ const conf = Config(
 	training_steps = 100000,
 	batch_size = 64,
 	num_iters = 100,
-	use_rs = true,
-	rs_R = 0.6f0,
+	use_rs = true, #true:RS使用/false:RS不使用
+	rs_R = 0.6f0, #希求水準の値
 	checkpoint_interval = 500,
 	temperature_initial = 1.0f0,
 	temperature_final = 1.0f0,
 	temperature_decay_steps = 10000,
 	temperature_threshold = 30,
 	intermediate_rewards = true,
-	results_path = mkpath(joinpath(GAME_DIR, "results")),
-	networks_path = mkpath(joinpath(GAME_DIR, "networks")),
+
+	#MuZeroの結果を保存する場合
+	#results_path = mkpath(joinpath(GAME_DIR, "results")),
+	#networks_path = mkpath(joinpath(GAME_DIR, "networks")),
+
+	#MuzeRSの結果を保存する場合
+	results_path = mkpath(joinpath(GAME_DIR, "results_muzers")),
+	networks_path = mkpath(joinpath(GAME_DIR, "networks_muzers")),
 )
 
 const hyper = FeedForwardHP(
