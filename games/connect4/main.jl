@@ -5,6 +5,7 @@ using Dates
 using Flux
 using ParameterSchedulers
 using Distributions
+using Logging
 
 try
 	import CUDA
@@ -13,8 +14,18 @@ catch err
 	@warn "CUDA/cuDNN are unavailable; running without explicit GPU setup." exception = err
 end
 
+const SRC_DIR = joinpath(@__DIR__, "../../src")
+const GAME_FILE = joinpath(@__DIR__, "game.jl")
+
+include(joinpath(SRC_DIR, "Constructors.jl"))
+include(joinpath(SRC_DIR, "SelfPlay.jl"))
+include(joinpath(SRC_DIR, "ReplayBuffer.jl"))
+include(joinpath(SRC_DIR, "Learning.jl"))
+include(GAME_FILE)
+include("params.jl")
+
 # --- Configuration for Workers ---
-const REQUIRED_SELF_PLAYERS = 1
+const REQUIRED_SELF_PLAYERS = max(1, conf.num_workers)
 const REQUIRED_LEARNERS = 1
 const TARGET_DEDICATED_WORKERS = REQUIRED_SELF_PLAYERS + REQUIRED_LEARNERS
 
@@ -32,16 +43,6 @@ end
 worker_ids = workers()
 dedicated_ids = filter(x -> x != 1, worker_ids)
 
-for pid in worker_ids
-    remotecall_fetch(() -> begin
-		Base.eval(Main, :(using Flux))
-		try
-			Base.eval(Main, :(import CUDA))
-		catch
-		end
-	end, pid)
-end
-
 # println("Dedicated PIDs: $dedicated_ids")
 
 if length(dedicated_ids) < TARGET_DEDICATED_WORKERS
@@ -49,29 +50,20 @@ if length(dedicated_ids) < TARGET_DEDICATED_WORKERS
 	exit(1)
 end
 
-@everywhere begin
-
+@everywhere worker_ids begin
     using Logging
     _old_logger = global_logger(NullLogger())
     Base.eval(Main, :(using Flux))
-	try
-		Base.eval(Main, :(import CUDA))
-	catch
-	end
     global_logger(_old_logger)
 	using Distributed
 	using ParameterSchedulers
 
-	const SRC_DIR = joinpath(@__DIR__, "../../src")
-
-	include(joinpath(SRC_DIR, "Constructors.jl"))
-	include(joinpath(SRC_DIR, "SelfPlay.jl"))
-	include(joinpath(SRC_DIR, "ReplayBuffer.jl"))
-	include(joinpath(SRC_DIR, "Learning.jl"))
-	include("game.jl")
+	include(joinpath($SRC_DIR, "Constructors.jl"))
+	include(joinpath($SRC_DIR, "SelfPlay.jl"))
+	include(joinpath($SRC_DIR, "ReplayBuffer.jl"))
+	include(joinpath($SRC_DIR, "Learning.jl"))
+	include($GAME_FILE)
 end
-
-include("params.jl")
 
 env = Connect4()
 
@@ -83,8 +75,8 @@ total_samples = RemoteChannel(() -> Channel{Int}(1))
 
 remote_NNs = RemoteChannel(() -> Channel{NamedTuple{(:representation, :prediction, :dynamics), Tuple{Any, Any, Any}}}(1))
 
-# NEW: The Game Queue (Replaces RemoteBufferChannel)
-game_queue = RemoteChannel(() -> Channel{GameHistory}(200))
+# Self-play workers can produce bursts of games, so scale the queue with worker count.
+game_queue = RemoteChannel(() -> Channel{GameHistory}(max(200, 20 * conf.num_workers)))
 
 # println("Initializing networks...")
 rep = init_representation(hyper, conf)
@@ -139,6 +131,17 @@ put!(total_samples, 0)
 
 learner_pid = pop!(dedicated_ids)
 self_play_pids = dedicated_ids
+
+if conf.selfplay_on_gpu
+	remotecall_fetch(learner_pid) do
+		try
+			Base.eval(Main, :(import CUDA))
+			Base.eval(Main, :(import cuDNN))
+		catch err
+			@warn "CUDA/cuDNN are unavailable on learner worker; falling back may be slower." exception = err
+		end
+	end
+end
 
 # println("Assignments:")
 # println("   Learner PID:   $learner_pid")

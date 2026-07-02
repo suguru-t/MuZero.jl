@@ -402,6 +402,9 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 end
 
 function self_play!(env, training_step, remote_NNs, game_queue::RemoteChannel, conf::Config)::Bool
+	Random.seed!(conf.seed + myid())
+	global rng = MersenneTwister(conf.seed + myid())
+
 	NNs = set_inference_mode!(fetch(remote_NNs))
 	last_network_update_step = 0
 	last_sync_time = time()

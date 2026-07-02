@@ -54,6 +54,8 @@ end
 	training_steps::Int # Total number of training steps (ie weights update according to a batch)
 	batch_size::Int # Number of parts of games to train on at each training step
 	checkpoint_interval::Int = 10 # Number of training steps before using the model for self-playing
+	finite_check_interval::Int = 100 # 重い有限値チェックを何stepごとに行うか。0なら無効。
+	memory_cleanup_interval::Int = 100 # 重いGC/CUDAメモリ整理を何stepごとに行うか。0なら無効。
 	value_loss_weight::Float32 = 0.25 # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
 end
 

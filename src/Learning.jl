@@ -32,6 +32,10 @@ function reclaim_cuda_if_loaded()
 	return nothing
 end
 
+function should_run_periodic(step::Int, interval::Int)::Bool
+	return interval > 0 && (step == 0 || step % interval == 0)
+end
+
 function set_training_mode!(NNs)
 	Flux.trainmode!(NNs.representation)
 	Flux.trainmode!(NNs.prediction)
@@ -234,23 +238,30 @@ function learning!(training_step, remote_NNs, game_queue::RemoteChannel, conf::C
 			compute_total_loss(m_rep, m_pred, m_dyn, observation_batch, action_batch, target_values, target_rewards, target_policies, weight_batch, gradient_scale_batch, conf)
 		end
 		assert_finite_scalar("loss", val, training_step_)
-		assert_finite_tree("representation gradient", grads[1], training_step_)
-		assert_finite_tree("prediction gradient", grads[2], training_step_)
-		assert_finite_tree("dynamics gradient", grads[3], training_step_)
+		run_full_finite_check = should_run_periodic(training_step_, conf.finite_check_interval)
+		if run_full_finite_check
+			assert_finite_tree("representation gradient", grads[1], training_step_)
+			assert_finite_tree("prediction gradient", grads[2], training_step_)
+			assert_finite_tree("dynamics gradient", grads[3], training_step_)
+		end
 
 		Flux.update!(opt_state_rep, representation, grads[1])
 		Flux.update!(opt_state_pred, prediction, grads[2])
 		Flux.update!(opt_state_dyn, dynamics, grads[3])
-		assert_finite_networks((representation = representation, prediction = prediction, dynamics = dynamics), training_step_)
+		if run_full_finite_check
+			assert_finite_networks((representation = representation, prediction = prediction, dynamics = dynamics), training_step_)
+		end
 
 		grads = nothing
-		GC.gc(true)
-		reclaim_cuda_if_loaded()
+		if should_run_periodic(training_step_, conf.memory_cleanup_interval)
+			GC.gc(false)
+			reclaim_cuda_if_loaded()
+		end
 
 		if conf.PER
 			(final_pred_values, _, _) = unroll_network(representation, prediction, dynamics, observation_batch, action_batch, conf)
 			priorities = (abs.(final_pred_values - target_values)) .^ conf.PER_alpha
-			assert_finite_array("PER priorities", priorities, training_step_)
+			run_full_finite_check && assert_finite_array("PER priorities", priorities, training_step_)
 			update_priorities!(local_buffer, cpu(priorities), index_batch)
 		end
 

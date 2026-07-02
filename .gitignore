@@ -76,3 +76,5 @@ events.out.*
 # Generated training/evaluation outputs
 games/*/results/
 games/*/networks/
+games/*/results_*/
+games/*/networks_*/

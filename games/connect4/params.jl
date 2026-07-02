@@ -5,7 +5,7 @@ const conf = Config(
 	action_space = collect(1:7),
 	players = collect(1:2),
 	stacked_observations = 0,
-	num_workers = 9,
+	num_workers = 8,
 	max_moves = 42,
 	num_unroll_steps = 20,
 	td_steps = 10,
@@ -13,10 +13,10 @@ const conf = Config(
 	opponent = "human",
 	training_steps = 100000,
 	batch_size = 64,
-	num_iters = 100,
-	use_rs = true, #true:RS使用/false:RS不使用
+	num_iters = 20, #探索回数
+	use_rs = false, #true:RS使用/false:RS不使用
 	rs_R = 0.6f0, #希求水準の値
-	checkpoint_interval = 500,
+	checkpoint_interval = 200,
 	temperature_initial = 1.0f0,
 	temperature_final = 1.0f0,
 	temperature_decay_steps = 10000,
@@ -24,12 +24,14 @@ const conf = Config(
 	intermediate_rewards = true,
 
 	#MuZeroの結果を保存する場合
-	#results_path = mkpath(joinpath(GAME_DIR, "results")),
-	#networks_path = mkpath(joinpath(GAME_DIR, "networks")),
+	results_path = mkpath(joinpath(GAME_DIR, "results")),
+	networks_path = mkpath(joinpath(GAME_DIR, "networks")),
 
 	#MuzeRSの結果を保存する場合
-	results_path = mkpath(joinpath(GAME_DIR, "results_muzers")),
-	networks_path = mkpath(joinpath(GAME_DIR, "networks_muzers")),
+	#results_path = mkpath(joinpath(GAME_DIR, "results_muzers")),
+	#networks_path = mkpath(joinpath(GAME_DIR, "networks_muzers")),
+
+	selfplay_on_gpu = true, #GPUで自己対戦を行うかどうか
 )
 
 const hyper = FeedForwardHP(
