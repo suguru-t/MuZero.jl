@@ -47,8 +47,7 @@ function make_target(history::GameHistory, state_index::Int, conf::Config)::Tupl
 	return target_values, target_rewards, target_policies, actions
 end
 
-function normalize_probs(values::AbstractVector{<:Real})::Vector{Float32}
-	probs = Float32.(values)
+function normalize_probs(probs::Vector{Float32})::Vector{Float32}
 	total = sum(probs)
 	if isempty(probs)
 		return Float32[]
@@ -59,10 +58,22 @@ function normalize_probs(values::AbstractVector{<:Real})::Vector{Float32}
 	return probs ./ total
 end
 
+function initialized_priorities(history::GameHistory)::Vector{Float32}
+	priorities = history.priorities
+	isnothing(priorities) && error("PER priorities were not initialized before sampling.")
+	return priorities
+end
+
+function initialized_game_priority(history::GameHistory)::Float32
+	priority = history.game_priority
+	isnothing(priority) && error("PER game priority was not initialized before sampling.")
+	return priority
+end
+
 function sample_position(history::GameHistory, conf::Config; force_uniform = false)::Tuple{Int, Float32}
 	position_prob = 0.0f0
 	if conf.PER && !force_uniform
-		position_probs = normalize_probs(history.priorities)
+		position_probs = normalize_probs(initialized_priorities(history))
 		position_index = rand(rng, Categorical(position_probs))
 		position_prob = position_probs[position_index]
 	else
@@ -76,12 +87,19 @@ function sample_n_games(buffer::Dict{Int, GameHistory}, conf::Config; force_unif
 		game_id_list = Vector{Int}()
 		game_probs = Vector{Float32}()
 		for (game_id, history) in buffer
-			append!(game_id_list, game_id)
-			push!(game_probs, history.game_priority)
+			push!(game_id_list, game_id)
+			push!(game_probs, initialized_game_priority(history))
 		end
-		game_probs = normalize_probs(game_probs)
-		game_prob_dict = Dict(game_id => prob for (game_id, prob) in zip(game_id_list, game_probs))
-		selected_games = [game_id_list[i] for i in rand(rng, Categorical(game_probs), conf.batch_size)]
+		game_probs_total = sum(game_probs)
+		normalized_game_probs = if isempty(game_probs)
+			Float32[]
+		elseif !isfinite(game_probs_total) || game_probs_total <= 0 || !all(isfinite, game_probs)
+			fill(1.0f0 / length(game_probs), length(game_probs))
+		else
+			game_probs ./ game_probs_total
+		end
+		game_prob_dict = Dict(game_id => prob for (game_id, prob) in zip(game_id_list, normalized_game_probs))
+		selected_games = [game_id_list[i] for i in rand(rng, Categorical(normalized_game_probs), conf.batch_size)]
 		n_games = [(game_id, buffer[game_id], game_prob_dict[game_id]) for game_id in selected_games]
 	else
 		selected_games = rand(collect(keys(buffer)), conf.batch_size)
@@ -95,11 +113,18 @@ function sample_game(buffer::Dict{Int, GameHistory}, num_played_games_count::Int
 	if conf.PER && !force_uniform
 		game_probs = Vector{Float32}()
 		for (_, history) in buffer
-			append!(game_probs, history.game_priority)
+			push!(game_probs, initialized_game_priority(history))
 		end
-		game_probs = normalize_probs(game_probs)
-		game_index = rand(rng, Categorical(game_probs))
-		game_prob = game_probs[game_index]
+		game_probs_total = sum(game_probs)
+		normalized_game_probs = if isempty(game_probs)
+			Float32[]
+		elseif !isfinite(game_probs_total) || game_probs_total <= 0 || !all(isfinite, game_probs)
+			fill(1.0f0 / length(game_probs), length(game_probs))
+		else
+			game_probs ./ game_probs_total
+		end
+		game_index = rand(rng, Categorical(normalized_game_probs))
+		game_prob = normalized_game_probs[game_index]
 	else
 		game_index = rand(1:length(buffer))
 	end

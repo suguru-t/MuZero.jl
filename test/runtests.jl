@@ -121,6 +121,32 @@ include(joinpath(GAME_DIR, "params.jl"))
 		@test select_action(root, 0.0f0) == 7
 	end
 
+	@testset "MCTS updates legal actions after simulated moves" begin
+		test_conf = Config(conf; stacked_observations = 0, num_iters = 1)
+		env = TicTacToe()
+		observation = Float32.(ReinforcementLearningBase.reset!(env))
+		legal_actions = Int.(collect(ReinforcementLearningBase.legal_action_space(env, ReinforcementLearningBase.current_player(env))))
+		rep = init_representation(hyper, test_conf)
+		pred = init_prediction(hyper, test_conf)
+		dyn = init_dynamics(hyper, test_conf)
+
+		root = run_mcts(
+			env,
+			observation,
+			legal_actions,
+			ReinforcementLearningBase.current_player(env),
+			false,
+			(representation = rep, prediction = pred, dynamics = dyn),
+			test_conf,
+		)
+
+		expanded_children = [(action, child) for (action, child) in root.children if !isnothing(child.children)]
+		@test length(expanded_children) == 1
+		action, child = only(expanded_children)
+		@test !(action in child.legal_actions)
+		@test length(child.legal_actions) == length(legal_actions) - 1
+	end
+
 	@testset "Two-player MCTS backprop signs" begin
 		test_conf = Config(conf; discount = 0.9f0)
 		root = Node(prior = 0.0f0, to_play = 1)

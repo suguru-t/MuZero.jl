@@ -14,11 +14,12 @@ using JLD2
 using Dates
 
 using Flux: Chain, Dense, Conv, BatchNorm, SkipConnection, MeanPool, MaxPool, AdaptiveMeanPool
+using ChainRulesCore: ignore_derivatives
 using Zygote: Zygote
 
 apply_tanh(x) = tanh.(x)
 apply_sigmoid(x) = sigmoid.(x)
-scale_gradient(x, scale::Real) = x .* scale .+ Zygote.dropgrad(x) .* (1 - scale)
+scale_gradient(x, scale::Real) = x .* scale .+ ignore_derivatives(x) .* (1 - scale)
 
 function maybe_gpu(x, conf::Config)
 	x === nothing && return nothing
@@ -329,13 +330,18 @@ end
 function compute_loss_breakdown(rep, pred, dyn, obs_batch, act_batch, t_vals, t_rews, t_pols, w_batch, g_scale, conf)
 	(p_vals, p_rews, p_pols) = unroll_network(rep, pred, dyn, obs_batch, act_batch, conf)
 
-	!conf.PER ? w_batch = 1.0f0 : nothing
 	policy_g_scale = reshape(g_scale, 1, 1, :)
-	policy_weight_batch = conf.PER ? reshape(w_batch, 1, 1, :) : 1.0f0
+	if conf.PER
+		value_weight_batch = w_batch
+		policy_weight_batch = reshape(w_batch, 1, 1, :)
+	else
+		value_weight_batch = 1.0f0
+		policy_weight_batch = 1.0f0
+	end
 
-	v_loss = conf.value_loss_weight * mse(p_vals, t_vals, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* w_batch))
+	v_loss = conf.value_loss_weight * mse(p_vals, t_vals, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* value_weight_batch))
 
-	r_loss = mse(p_rews, t_rews, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* w_batch))
+	r_loss = mse(p_rews, t_rews, agg = x -> mean((sum(x, dims = 1) ./ g_scale) .* value_weight_batch))
 
 	p_loss = logitcrossentropy(p_pols, t_pols, agg = x -> mean((sum(x, dims = 2) ./ policy_g_scale) .* policy_weight_batch))
 
@@ -345,11 +351,16 @@ end
 function loss_base(predictions, targets, weight_batch, gradient_scale_batch, conf)
 	value, reward, policy_logits = predictions
 	target_values, target_rewards, target_policies = targets
-	!conf.PER ? weight_batch = 1.0f0 : nothing
 	policy_gradient_scale_batch = reshape(gradient_scale_batch, 1, 1, :)
-	policy_weight_batch = conf.PER ? reshape(weight_batch, 1, 1, :) : 1.0f0
-	value_loss = conf.value_loss_weight * mse(value, target_values, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* weight_batch))
-	reward_loss = mse(reward, target_rewards, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* weight_batch))
+	if conf.PER
+		value_weight_batch = weight_batch
+		policy_weight_batch = reshape(weight_batch, 1, 1, :)
+	else
+		value_weight_batch = 1.0f0
+		policy_weight_batch = 1.0f0
+	end
+	value_loss = conf.value_loss_weight * mse(value, target_values, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* value_weight_batch))
+	reward_loss = mse(reward, target_rewards, agg = x -> mean((sum(x, dims = 1) ./ gradient_scale_batch) .* value_weight_batch))
 	policy_loss = logitcrossentropy(policy_logits, target_policies, agg = x -> mean((sum(x, dims = 2) ./ policy_gradient_scale_batch) .* policy_weight_batch))
 	return sum([value_loss, reward_loss, policy_loss])
 end

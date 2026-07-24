@@ -18,6 +18,12 @@ mutable struct MinMaxStats
 	max::Float32
 end
 
+struct SearchState
+	legal_actions::Vector{Int}
+	to_play::Int
+	terminal::Bool
+end
+
 function update_tree!(treeminmax::MinMaxStats, value::Float32)::Nothing
 	treeminmax.min = treeminmax.min < value ? treeminmax.min : value
 	treeminmax.max = treeminmax.max > value ? treeminmax.max : value
@@ -62,11 +68,36 @@ using Flux: softmax
 	value_sum::Float32 = 0.0
 	children::Union{Dict{Int, Node}, Nothing} = nothing
 	hidden_state::Union{Array{Float32, 3}, Nothing} = nothing
+	legal_actions::Vector{Int} = Int[]
 	reward::Union{Float32, Int} = 0
 end
 
 function expanded(node::Node)::Bool
-	return !isnothing(node.children)
+	return !isnothing(node.children) && !isempty(node.children)
+end
+
+function node_hidden_state(node::Node)::Array{Float32, 3}
+	hidden_state = node.hidden_state
+	isnothing(hidden_state) && error("MCTS node hidden state was not initialized.")
+	return hidden_state
+end
+
+first_scalar(x::Number)::Float32 = Float32(x)
+first_scalar(x::AbstractArray)::Float32 = Float32(first(x))
+
+function current_player_index(env)::Int
+	player = ReinforcementLearningBase.current_player(env)
+	player isa Int || error("MCTS current player must be an Int. Got $(typeof(player)).")
+	return player
+end
+
+function legal_action_list(env, to_play::Int)::Vector{Int}
+	return Int.(collect(ReinforcementLearningBase.legal_action_space(env, to_play)))
+end
+
+function mcts_hidden_state(hidden_state::AbstractArray, conf::Config)::Array{Float32, 3}
+	reshaped = ndims(hidden_state) == 2 ? reshape(hidden_state, (conf.observation_shape..., 1)) : hidden_state
+	return Array{Float32, 3}(drop_singleton_dims(reshaped))
 end
 
 function sanitize_mcts_value(x, conf::Config, context::String)::Float32
@@ -108,6 +139,7 @@ function safe_policy_values(policy_logits::Vector{Float32}, actions, conf::Confi
 end
 
 function expand_node!(node, actions, to_play, reward, policy_logits, hidden_state, conf::Config; value_prior = 0.0f0)
+	node.legal_actions = Int.(collect(actions))
 	policy_values = safe_policy_values(policy_logits, actions, conf)
 	policy = Dict([(a, policy_values[i]) for (i, a) in enumerate(actions)])
 	node.children = Dict([(action, Node(prior = prob)) for (action, prob) in policy])
@@ -121,6 +153,36 @@ function expand_node!(node, actions, to_play, reward, policy_logits, hidden_stat
 	end
 	node.hidden_state = hidden_state_array
 	return nothing
+end
+
+function mark_terminal_node!(node, to_play, reward, hidden_state, conf::Config; value_prior = 0.0f0)
+	node.legal_actions = Int[]
+	node.children = Dict{Int, Node}()
+	node.to_play = Int(to_play)
+	node.reward = sanitize_mcts_value(reward, conf, "reward")
+	node.value_prior = sanitize_mcts_value(value_prior, conf, "value prior")
+	hidden_state_array = Array{Float32, 3}(hidden_state)
+	if !all(isfinite, hidden_state_array)
+		conf.allow_nonfinite_mcts || error("hidden state became non-finite during MCTS")
+		hidden_state_array = sanitize_mcts_value.(hidden_state_array, Ref(conf), Ref("hidden state"))
+	end
+	node.hidden_state = hidden_state_array
+	return nothing
+end
+
+function search_state_after_path(env, parent::Node, actions::Vector{Int}, virtual_to_play::Int)::SearchState
+	isnothing(env) && return SearchState(parent.legal_actions, virtual_to_play, false)
+
+	search_env = deepcopy(env)
+	for action in actions
+		ReinforcementLearningBase.is_terminated(search_env) && break
+		search_env(action)
+	end
+
+	terminal::Bool = ReinforcementLearningBase.is_terminated(search_env)
+	to_play::Int = current_player_index(search_env)
+	legal_actions = terminal ? Int[] : legal_action_list(search_env, to_play)
+	return SearchState(legal_actions, to_play, terminal)
 end
 
 function add_exploration_noise!(node::Node, dirichlet_alpha::Float32, exploration_epsilon::Float32)::Nothing
@@ -235,20 +297,21 @@ function search_score(parent_node::Node, child::Node, treeminmax::MinMaxStats, c
 	end
 end
 
-function backpropagate!(search_path::Vector{Node}, value::Float32, to_play::Int, treeminmax::MinMaxStats, conf::Config)::Nothing
+function backpropagate!(search_path::Vector{Node}, value::Real, to_play::Integer, treeminmax::MinMaxStats, conf::Config)::Nothing
+	value32::Float32 = Float32(value)
 	if length(conf.players) == 1
 		for node in reverse(search_path)
-			node.value_sum += value
+			node.value_sum += value32
 			node.visit_count += 1
 			update_tree!(treeminmax, node.reward + conf.discount * node_value(node, conf))
-			value = node.reward + conf.discount * value
+			value32 = node.reward + conf.discount * value32
 		end
 	elseif length(conf.players) == 2
 		for node in reverse(search_path)
-			node.value_sum += value
+			node.value_sum += value32
 			node.visit_count += 1
 			update_tree!(treeminmax, node.reward - conf.discount * node_value(node, conf))
-			value = node.reward - conf.discount * value
+			value32 = node.reward - conf.discount * value32
 		end
 	else
 		ErrorException("backpropagate for more than 2 players is not implemented")
@@ -257,6 +320,10 @@ function backpropagate!(search_path::Vector{Node}, value::Float32, to_play::Int,
 end
 
 function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to_play::Int, exploration::Bool, NNs, conf::Config)::Node
+	return run_mcts(nothing, observation, legal_actions, to_play, exploration, NNs, conf)
+end
+
+function run_mcts(env, observation::Array{Float32, 3}, legal_actions::Vector{Int}, to_play::Int, exploration::Bool, NNs, conf::Config)::Node
 	root = Node(prior = 0.0)
 	observation = insert_singleton_dim(observation, 4)
 	hidden_state = NNs.representation(observation)
@@ -280,38 +347,56 @@ function run_mcts(observation::Array{Float32, 3}, legal_actions::Vector{Int}, to
 		add_exploration_noise!(root, conf.dirichlet_alpha, conf.exploration_epsilon)
 	end
 
-	treeminmax = MinMaxStats(Inf, -Inf)
+	treeminmax::MinMaxStats = MinMaxStats(Float32(Inf), -Float32(Inf))
 
 	max_tree_depth = 0
 	for iter in 1:conf.num_iters
 		node = root
+		parent = root
 		virtual_to_play = to_play
-		search_path = [node]
+		search_path = Vector{Node}()
+		push!(search_path, node)
+		path_actions = Vector{Int}()
 		current_tree_depth = 0
 		action=0
 		while expanded(node)
 			current_tree_depth += 1
+			parent = node
 			action, node = select_child(node, treeminmax, conf)
+			push!(path_actions, action)
 			push!(search_path, node)
 			virtual_to_play = mod1(virtual_to_play + 1, length(conf.players))
 		end
 
-		parent = search_path[end-1]
-		state_action = make_state_action(parent.hidden_state, action, conf)
+		search_state::SearchState = search_state_after_path(env, parent, path_actions, virtual_to_play)
+		state_action = make_state_action(node_hidden_state(parent), action, conf)
 		state_action = insert_singleton_dim(state_action, 4)
 		next_hidden_state, reward = NNs.dynamics(state_action)
-		if ndims(next_hidden_state)==2
-			next_hidden_state=reshape(next_hidden_state, (conf.observation_shape..., 1))
-		end
-		next_hidden_state, reward = drop_singleton_dims.([next_hidden_state, reward])
-		next_hidden_state = Array{Float32, 3}(next_hidden_state)
+		next_hidden_state_3d::Array{Float32, 3} = mcts_hidden_state(next_hidden_state, conf)
+		reward = drop_singleton_dims(reward)
+		reward_value = first_scalar(reward)
 
-		value, policy_logits = NNs.prediction(insert_singleton_dim(next_hidden_state, 4))
+		if search_state.terminal || isempty(search_state.legal_actions)
+			mark_terminal_node!(node, search_state.to_play, reward_value, next_hidden_state_3d, conf)
+			terminal_value::Float32 = 0.0f0
+			terminal_to_play::Int = search_state.to_play
+			backpropagate!(search_path, terminal_value, terminal_to_play, treeminmax, conf)
+			max_tree_depth = maximum([max_tree_depth, current_tree_depth])
+			continue
+		end
+
+		obs_w::Int = conf.observation_shape[1]
+		obs_h::Int = conf.observation_shape[2]
+		obs_c::Int = conf.observation_shape[3]
+		prediction_input = fill(0.0f0, (obs_w, obs_h, obs_c, 1))
+		prediction_input[:, :, :, 1] .= next_hidden_state_3d
+		value, policy_logits = NNs.prediction(prediction_input)
 		value, policy_logits = drop_singleton_dims.([value, policy_logits])
 		policy_logits = vec(Float32.(policy_logits))
+		value_prior = first_scalar(value)
 
-		expand_node!(node, legal_actions, virtual_to_play, reward[1], policy_logits, next_hidden_state, conf; value_prior = value[1])
-		backpropagate!(search_path, value[1], virtual_to_play, treeminmax, conf)
+		expand_node!(node, search_state.legal_actions, search_state.to_play, reward_value, policy_logits, next_hidden_state_3d, conf; value_prior = value_prior)
+		backpropagate!(search_path, value_prior, search_state.to_play, treeminmax, conf)
 		max_tree_depth = maximum([max_tree_depth, current_tree_depth])
 	end
 	return root
@@ -374,7 +459,7 @@ function play_game(env, temperature, render::Bool, opponent::String, muzero_play
 		root = nothing
 
 		action = if opponent == "self" || muzero_player == p
-			root = run_mcts(stacked_observations, ReinforcementLearningBase.legal_action_space(env, p), p, true, NNs, conf)
+			root = run_mcts(env, stacked_observations, ReinforcementLearningBase.legal_action_space(env, p), p, true, NNs, conf)
 			select_action(root, temperature)
 		else
 			select_opponent_action(env, opponent, stacked_observations, conf)

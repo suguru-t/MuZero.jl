@@ -138,7 +138,7 @@ function choose_muzero_action(env::Connect4, history::GameHistory, observation, 
 		eval_conf,
 	)
 	legal_actions = ReinforcementLearningBase.legal_action_space(env, p)
-	root = run_mcts(stacked_observations, legal_actions, p, false, NNs, eval_conf)
+	root = run_mcts(env, stacked_observations, legal_actions, p, false, NNs, eval_conf)
 	return select_action(root, 0.0f0)
 end
 
